@@ -71,28 +71,6 @@ subscribe to them and mean it. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#how-the-cap-is-actually-enforced) and
 [docs/COSTING.md](docs/COSTING.md) §4.
 
-## Before you put real students on it
-
-> [!WARNING]
-> **The admin console negotiates TLS 1.0.** The CloudFront distribution uses the
-> default `*.cloudfront.net` certificate, and CloudFront pairs that certificate
-> with the `TLSv1` security policy — TLS 1.0 and 1.1 included — and ignores any
-> `MinimumProtocolVersion` you set alongside it. Setting that property looks like
-> a fix, passes the scanners, and changes nothing.
->
-> **To actually get TLS 1.2 as the floor**, bring your own domain: request a
-> certificate for it in ACM **in us-east-1**, point `ViewerCertificate` at the
-> ACM ARN with `MinimumProtocolVersion: TLSv1.2_2021`, and add the domain to
-> `Aliases`. That is the only way to raise the floor; it needs a DNS zone you
-> control, which is why it is not the default.
->
-> What the weak floor does and does not cover: only the public static assets of
-> the console. The two endpoints that carry credentials — `execute-api` for the
-> API and the Cognito hosted UI for the password — refuse TLS 1.0 and 1.1
-> outright, so a downgrade cannot reach a token or a login. Full analysis, with
-> the measurements, is in
-> [docs/SECURITY-FINDINGS.md](docs/SECURITY-FINDINGS.md) §15.
-
 ## Getting started
 
 Read [docs/SETUP.md](docs/SETUP.md) first — `IdentityCenterInstanceType` sets the
