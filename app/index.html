@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="SageMaker student platform management console"
+    />
+    <!--
+      The unbranded defaults, matching DEFAULT_INIT in lib/api/init.ts.
+      BootstrapProvider replaces both at runtime from GET /init, so a branded
+      deployment overwrites them a moment after load - but these are what a
+      deployment with no branding, or an unreachable /init, is left showing.
+    -->
+    <title>AWS SageMaker GPU Guardian</title>
+    <link rel="icon" href="/brand/favicon.ico" type="image/x-icon" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

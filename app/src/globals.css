@@ -1,0 +1,12 @@
+/* Cloudscape owns all typography, color, and spacing. It must load first so
+   its custom properties are defined before anything below reads them. */
+@import "@cloudscape-design/global-styles/index.css";
+
+/* AppLayoutToolbar measures the viewport and needs a full-height ancestor
+   chain to size its side panels; without this the nav collapses to 0px. */
+html,
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}

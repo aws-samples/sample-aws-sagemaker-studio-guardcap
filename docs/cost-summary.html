@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPU Lab — Cost Summary</title>
+<style>
+  :root {
+    --ink:   #16191f;
+    --muted: #5f6b7a;
+    --line:  #d5dbdb;
+    --accent:#0972d3;
+    --good:  #037f0c;
+    --warn:  #8d6605;
+    --wash:  #f2f8fd;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    color: var(--ink);
+    margin: 0;
+    padding: 48px 24px 72px;
+    background: #fff;
+  }
+  main { max-width: 780px; margin: 0 auto; }
+  h1 { font-size: 30px; line-height: 1.25; margin: 0 0 4px; letter-spacing: -0.4px; }
+  h2 {
+    font-size: 13px; text-transform: uppercase; letter-spacing: 1.1px;
+    color: var(--muted); font-weight: 700;
+    margin: 44px 0 14px; padding-bottom: 8px; border-bottom: 1px solid var(--line);
+  }
+  .sub { color: var(--muted); margin: 0 0 8px; }
+  .lede { font-size: 18px; margin: 24px 0 0; }
+
+  /* headline figures */
+  .cards { display: flex; gap: 14px; flex-wrap: wrap; margin: 28px 0 0; }
+  .card {
+    flex: 1 1 190px; border: 1px solid var(--line); border-radius: 10px;
+    padding: 18px 20px; background: var(--wash);
+  }
+  .card .n { font-size: 30px; font-weight: 700; letter-spacing: -0.5px; display: block; }
+  .card .l { font-size: 13px; color: var(--muted); display: block; margin-top: 4px; }
+  .card.cap { background: #f2fcf3; border-color: #b7e5bc; }
+  .card.cap .n { color: var(--good); }
+
+  table { width: 100%; border-collapse: collapse; margin: 8px 0 0; font-size: 15px; }
+  th, td { text-align: left; padding: 11px 10px; border-bottom: 1px solid var(--line); }
+  th { font-size: 12.5px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); }
+  td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tr.total td { font-weight: 700; border-top: 2px solid var(--ink); border-bottom: none; }
+  tbody tr:last-child td { border-bottom: none; }
+
+  .note {
+    border-left: 3px solid var(--accent); background: var(--wash);
+    padding: 14px 18px; margin: 20px 0 0; border-radius: 0 6px 6px 0;
+  }
+  .note.caution { border-left-color: var(--warn); background: #fffce9; }
+  .note p { margin: 0; }
+  .note p + p { margin-top: 8px; }
+  .note strong { display: block; margin-bottom: 4px; }
+
+  ul { margin: 10px 0 0; padding-left: 22px; }
+  li { margin-bottom: 8px; }
+
+  footer {
+    margin-top: 52px; padding-top: 18px; border-top: 1px solid var(--line);
+    font-size: 13px; color: var(--muted);
+  }
+  @media print {
+    body { padding: 0; font-size: 12pt; }
+    .card { background: #fff !important; }
+    h2 { margin-top: 26px; }
+  }
+</style>
+</head>
+<body>
+<main>
+
+  <h1>GPU Teaching Lab — Cost Summary</h1>
+  <p class="sub">Prepared 24 August 2026, revised 27 August 2026 &nbsp;·&nbsp; illustrated for a class of 100 &nbsp;·&nbsp; all figures USD per month</p>
+
+  <p class="lede">
+    Students get their own GPU notebook environment with a <strong>hard spending limit built in</strong>.
+    Nobody can quietly run up a large bill: when a student reaches their limit, their
+    machine is shut down automatically and they cannot start another one.
+  </p>
+
+  <div class="cards">
+    <div class="card">
+      <span class="n">$30</span>
+      <span class="l">Typical cost per student, per month</span>
+    </div>
+    <div class="card cap">
+      <span class="n">$80</span>
+      <span class="l">Hard ceiling per student, per month</span>
+    </div>
+    <div class="card">
+      <span class="n">~$11</span>
+      <span class="l">Shared platform cost for all 100 students</span>
+    </div>
+  </div>
+
+  <h2>What a class of 100 costs</h2>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Item</th>
+        <th>What it is</th>
+        <th class="n">Per month</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>GPU time</td>
+        <td>100 students × about 6 hours a week each</td>
+        <td class="n">$2,930</td>
+      </tr>
+      <tr>
+        <td>Student storage</td>
+        <td>Saved work, kept between sessions, 56¢ each</td>
+        <td class="n">$56</td>
+      </tr>
+      <tr>
+        <td>Shared platform</td>
+        <td>Web console, database, monitoring, web firewall — for the whole class</td>
+        <td class="n">$11</td>
+      </tr>
+      <tr class="total">
+        <td colspan="2">Expected monthly total</td>
+        <td class="n">$2,997</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="note">
+    <p><strong>That works out to about $30 per student, per month.</strong></p>
+    <p>
+      <strong style="display:inline">98% of the bill is GPU time students actually use.</strong>
+      Everything else — the platform, the accounts, the storage — comes to $67 a month
+      for all 100 students. Costs are metered by the second, so a student who does not
+      log in costs 56¢ rather than $30.
+    </p>
+  </div>
+
+  <h2>The worst case is bounded</h2>
+
+  <p>
+    This is the part that matters for planning: the exposure is capped by design, not by trust.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Scenario</th>
+        <th class="n">One month</th>
+        <th class="n">One trimester</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Expected — normal use</td>
+        <td class="n">$2,997</td>
+        <td class="n">$9,001</td>
+      </tr>
+      <tr>
+        <td>Worst case — every student hits their full $80 limit</td>
+        <td class="n">$8,070</td>
+        <td class="n">$24,211</td>
+      </tr>
+      <tr>
+        <td>Worst case, with every cost assumption pushed the wrong way</td>
+        <td class="n">$8,271</td>
+        <td class="n">$24,812</td>
+      </tr>
+      <tr class="total">
+        <td>Budget we recommend setting aside</td>
+        <td class="n">—</td>
+        <td class="n">$26,000</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="note">
+    <p><strong>The guardrails cost under 1% of the spending they control.</strong></p>
+    <p>
+      Running the limit-enforcement machinery for 100 students costs about
+      <strong>$70 a month</strong> against an $8,070 ceiling — <strong>0.87%</strong>.
+      Even if every cost assumption is pushed the wrong way at once it reaches
+      3%. There is no realistic way for the platform itself to become a
+      material cost; the only line that can move the bill is GPU hours.
+    </p>
+  </div>
+
+  <div class="note caution">
+    <p><strong>Two honest caveats about the $80 limit.</strong></p>
+    <p>
+      <strong style="display:inline">The shutdown is not instantaneous.</strong>
+      Usage is checked every five minutes, so a student can land a few cents above
+      their limit — about <strong>9&nbsp;cents</strong> at the GPU machine we
+      recommend, and 12 cents at the most expensive one we allow. Across all 100
+      students that is under $10. Earlier designs checked only a few times a day,
+      which let an $80 limit drift to $89–97 — about <strong>$1,350 a month</strong>
+      of drift across this class size. That is the problem the five-minute check solves.
+    </p>
+    <p>
+      <strong style="display:inline">The limit covers machine time, not saved files.</strong>
+      A student's 56¢ of storage sits outside the $80, so the true worst case per
+      student is <strong>$80.56 plus a few cents</strong>. Students are shown this
+      wording on their own usage page rather than left to discover it.
+    </p>
+    <p>
+      Allow a little headroom above $80 per student; the $26,000 trimester budget
+      covers it comfortably.
+    </p>
+  </div>
+
+  <h2>Five points worth knowing</h2>
+
+  <ul>
+    <li>
+      <strong>The platform itself is essentially free, even at 100 students.</strong> Running the
+      console, database, monitoring and the web firewall in front of the console costs about
+      $11 a month for the entire class — $10 of which is fixed and does not change with class
+      size. It grows by roughly <strong>one cent per student</strong>, so headcount is not what
+      drives the bill.
+    </li>
+    <li>
+      <strong>Idle costs are negligible.</strong> Between trimesters, with no students enrolled,
+      the lab costs about $10 a month — the fixed part of the platform — and an enrolled student
+      who never logs in adds 56¢. There is no need to tear the lab down and rebuild it.
+    </li>
+    <li>
+      <strong>The main cost risk is a machine left running, and it is handled.</strong>
+      A GPU notebook forgotten over a weekend would cost around $1,000 a month if nothing
+      stopped it. Eight of them left running for a trimester would consume the entire
+      $26,000 budget. The automatic shutdown is what turns that into a capped $80.
+    </li>
+    <li>
+      <strong>The choice of GPU is worth $736 a month at this class size.</strong>
+      The machine we default to, <code>ml.g6.xlarge</code>, is both newer and about
+      20% cheaper per hour than <code>ml.g5.xlarge</code> — $1.1270 against $1.4100
+      per hour, on the list prices cited below. An $80 limit buys about 71 hours on
+      it — roughly 2.7 hours a week across a trimester. The full comparison is in
+      <code>docs/COSTING.md</code>.
+    </li>
+    <li>
+      <strong>Students can see their own spending.</strong> Each student has a page showing
+      what they have used this month, how much of their limit is left, and roughly how many
+      hours that buys them. It is the same figure the shutdown decision is made on, so there
+      is nothing to dispute after the fact.
+    </li>
+  </ul>
+
+  <h2>Cost per student, at different class sizes</h2>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Class size</th>
+        <th class="n">Total per month</th>
+        <th class="n">Per student</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>10 students</td><td class="n">$309</td><td class="n">$31</td></tr>
+      <tr><td>30 students</td><td class="n">$907</td><td class="n">$30</td></tr>
+      <tr><td>100 students</td><td class="n">$2,997</td><td class="n">$30</td></tr>
+    </tbody>
+  </table>
+
+  <p style="margin-top:14px;color:var(--muted);font-size:15px;">
+    Cost scales almost perfectly with headcount above about ten students. The one fixed
+    cost is roughly $10 a month for the platform and the firewall protecting it, which a
+    very small pilot carries in full — so growing to 100 students carries no penalty
+    beyond the GPU hours those students use.
+  </p>
+
+  <footer>
+    Figures are Amazon’s published list prices for the N. Virginia region, retrieved
+    24&nbsp;August&nbsp;2026, excluding tax and any institutional discount. Assumes roughly
+    6&nbsp;GPU-hours per student per week on a mid-range GPU machine. Platform figures were
+    verified against live usage metrics on 25&nbsp;August&nbsp;2026 rather than estimated.
+    Full technical breakdown with sources: <code>docs/COSTING.md</code>.
+  </footer>
+
+</main>
+</body>
+</html>

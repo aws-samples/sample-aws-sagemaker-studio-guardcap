@@ -1,0 +1,2438 @@
+# THE PLATFORM STACK. Deploy once per class; each student is then a separate
+# stack created from the per-student template by the admin console.
+#
+# Resource by resource: docs/ARCHITECTURE.md. Parameters and what cannot be changed
+# later: docs/SETUP.md. Deploy, day-2 and teardown (which has a manual tail):
+# docs/DEPLOYMENT.md. Every scanner suppression: docs/SECURITY-FINDINGS.md.
+#
+# Two things to know before editing anything below:
+#   - The cap is self-metered, not AWS Budgets, and it fails SILENT rather than
+#     closed. It works only while UsageSyncRule is enabled and the backend is
+#     healthy, which is what section 14's alarms exist to catch.
+#   - Per-student resources are found BY NAME (gpu-guardian-${StudentId}-*),
+#     not by reference. Renaming one silently breaks enforcement.
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SageMaker GPU Guardian - the platform stack. Deploy once to stand up a GPU
+  notebook lab for a whole class: VPC, SageMaker Studio domain, the Identity
+  Center or Cognito sign-in path, three DynamoDB tables (students, alarm events,
+  usage ledger), the admin backend Lambda behind a 14-route HTTP API, three
+  scheduled jobs, a CloudFront-hosted console, and alarms on the backend.
+
+  Cap enforcement is self-metered, not AWS Budgets. The usage_sync job samples
+  Studio runtime every SweepMinutes into the ledger, prices it from a rate
+  table, and attaches the per-student deny policy itself. Neither this template
+  nor the per-student one contains an AWS::Budgets::Budget - see
+  docs/COSTING.md section 4.
+
+  Per-student resources are NOT here. The console provisions each student as its
+  own stack from the per-student template, which must be uploaded to
+  TemplatesBucket at StudentTemplateS3Key along with the backend handler at
+  BackendScriptS3Key first.
+
+  Setup and parameters: docs/SETUP.md. Deploy and teardown: docs/DEPLOYMENT.md.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: IAM Identity Center (must already be enabled - see docs/SETUP.md)
+        Parameters:
+          - IdentityCenterInstanceType
+          - IdentityCenterInstanceArn
+          - IdentityStoreId
+          - IdcSamlMetadataUrl
+      - Label:
+          default: Class-wide cost pool
+        Parameters:
+          - ClassPoolCapUsd
+          - NotificationEmail
+          - EnableCostAnomalyMonitor
+      - Label:
+          default: Admin console
+        Parameters:
+          - AdminNotificationEmail
+          - BackendScriptS3Key
+          - StudentTemplateS3Key
+          - SweepMinutes
+      - Label:
+          default: Branding (served unauthenticated by GET /init)
+        Parameters:
+          - AppTitle
+          - AppShortName
+          - AppLogoUrl
+          - AppFaviconUrl
+          - AppPrimaryColor
+          - AppInstitutionName
+          - AppSupportEmail
+
+Parameters:
+  IdentityCenterInstanceType:
+    Type: String
+    AllowedValues: [ORGANIZATION, ACCOUNT]
+    Description: >-
+      Read "Instance type" off the Identity Center console Settings page.
+      ORGANIZATION gives the Studio domain AuthMode SSO; ACCOUNT gives it
+      AuthMode IAM and makes Cognito the identity source for admins and
+      students both. No default on purpose: guessing wrong fails the deploy
+      mid-create, and AuthMode cannot be changed without replacing the domain
+      and every student's home directory. docs/SETUP.md.
+
+  IdentityCenterInstanceArn:
+    Type: String
+    Default: ''
+    Description: 'ARN of the existing Identity Center instance. Required under ORGANIZATION, leave empty under ACCOUNT. Identity Center must already be enabled; this stack cannot create it.'
+    AllowedPattern: '^$|^arn:aws.*:sso:::instance/ssoins-[0-9a-f]+$'
+    ConstraintDescription: Must be empty or an IAM Identity Center instance ARN, e.g. arn:aws:sso:::instance/ssoins-1234567890abcdef.
+
+  IdentityStoreId:
+    Type: String
+    Default: ''
+    Description: 'Identity Store ID from the Identity Center console Settings page. Required under ORGANIZATION, leave empty under ACCOUNT.'
+    AllowedPattern: '^$|^d-[0-9a-z]+$'
+    ConstraintDescription: Must be empty or an Identity Store ID, e.g. d-1234567890.
+
+  # Both default to '' and are read only under Condition: IsOrgInstance. CloudFormation
+  # cannot express "required when IdentityCenterInstanceType is ORGANIZATION", so an
+  # ORGANIZATION deploy that omits them fails on the first identity-store resource
+  # instead - noisily, and before anything else is created.
+
+  IdcSamlMetadataUrl:
+    Type: String
+    Default: ''
+    Description: >-
+      Metadata URL of the Identity Center SAML application. ORGANIZATION only,
+      and empty on the first deploy: the federation is circular, so pass one
+      publishes SamlAcsUrl and SamlAudience, you register the SAML app by hand,
+      then update the stack with this set. docs/SETUP.md.
+
+  ClassPoolCapUsd:
+    Type: Number
+    Default: 8000
+    MinValue: 0
+    Description: >-
+      Monthly cap in USD across the whole class. NOTIFY-ONLY by design: it emails,
+      it never suspends anybody, because locking a whole class out is a decision an
+      operator should make deliberately. 0 disables the check.
+
+  NotificationEmail:
+    Type: String
+    Description: Ops address for class-pool and anomaly notices, and the default for each per-student stack. SNS delivers nothing until the confirmation mail is clicked.
+
+  EnableCostAnomalyMonitor:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Leave 'false' unless you have checked: AWS allows only ONE SERVICE-dimension
+      Cost Anomaly Monitor per account, and a second one fails the whole stack with
+      AlreadyExists. Check with `aws ce get-anomaly-monitors` first.
+
+  AdminNotificationEmail:
+    Type: String
+    Description: >-
+      Ops address for backend alarms and dead letters. Also shown to
+      unauthenticated callers by GET /init as the support contact, so use a team
+      alias rather than a person.
+
+  BackendScriptS3Key:
+    Type: String
+    Default: scripts/01-admin-platform-api.py
+    Description: >-
+      Key, inside TemplatesBucket, of the backend handler source. The Lambda
+      fetches it on cold start, so the object must exist before the console works.
+
+  StudentTemplateS3Key:
+    Type: String
+    Default: templates/04-Sagemaker-Gpu-Student.yaml
+    Description: >-
+      Key, inside TemplatesBucket, of the per-student template. The stack writes
+      its URL to SSM, so uploading the file is the only bootstrap step left.
+
+  SweepMinutes:
+    Type: Number
+    Default: 5
+    # MinValue 2: UsageSyncRule always writes the plural, and EventBridge demands
+    # 'rate(1 minute)' at 1.
+    MinValue: 2
+    MaxValue: 60
+    Description: >-
+      How often the metering sweep runs, in minutes. This IS the accuracy of the
+      cap - worst-case overshoot is one interval of runtime, about $0.12 at 5
+      minutes and $1.41 at 60 on the priciest allowed instance. Raising it saves
+      nothing measurable.
+
+  # --- Branding, served by the unauthenticated GET /init ------------------
+  # Reaches anonymous callers. Nothing here is a secret; treat it as world-readable.
+
+  AppTitle:
+    Type: String
+    Default: ''
+    Description: Browser title and console header. Empty falls back to 'SageMaker GPU Guardian'.
+
+  AppShortName:
+    Type: String
+    Default: ''
+    Description: Short name for the nav bar and narrow layouts. Empty falls back to 'GPU Guardian'.
+
+  AppLogoUrl:
+    Type: String
+    Default: ''
+    Description: >-
+      Absolute https URL of the header logo. Must be publicly reachable - the
+      browser fetches it before sign-in, so anything behind auth renders broken.
+      Empty falls back to the AWS logo.
+
+  AppFaviconUrl:
+    Type: String
+    Default: ''
+    Description: Absolute https URL of the favicon, publicly reachable like AppLogoUrl. Empty falls back to the AWS favicon.
+
+  AppPrimaryColor:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^#[0-9A-Fa-f]{6}$'
+    ConstraintDescription: Must be empty or a 6-digit hex colour with a leading '#', e.g. '#0972d3'.
+    Description: Accent colour for buttons and links. Empty falls back to Cloudscape blue, '#0972d3'.
+
+  AppInstitutionName:
+    Type: String
+    Default: ''
+    Description: Institution shown in the footer and on the sign-in card. Empty omits the line.
+
+  AppSupportEmail:
+    Type: String
+    Default: ''
+    Description: >-
+      Address a suspended student is told to contact to get their cap raised.
+      Empty leaves them with no next step in the UI. Rendered to anonymous
+      callers, so use a team alias.
+
+Conditions:
+  CreateAnomalyMonitor: !Equals [!Ref EnableCostAnomalyMonitor, 'true']
+  IsOrgInstance:        !Equals [!Ref IdentityCenterInstanceType, 'ORGANIZATION']
+  HasSamlMetadata:      !Not [!Equals [!Ref IdcSamlMetadataUrl, '']]
+  # Gated on the PAIR, not on HasSamlMetadata alone: an ACCOUNT-mode deploy that
+  # leaves IdcSamlMetadataUrl set then falls back to local Cognito users instead of
+  # failing on a SAML app that cannot exist.
+  UseSamlFederation:    !And [!Condition HasSamlMetadata, !Condition IsOrgInstance]
+  # A WAFv2 WebACL with Scope: CLOUDFRONT exists ONLY in us-east-1 - the API rejects
+  # it anywhere else - so the console's WAF is gated on the region rather than made
+  # unconditional, which would make the whole stack undeployable outside us-east-1.
+  # Deploy the platform stack in us-east-1 if you want the WAF. Outside it the stack
+  # still comes up and the distribution is simply unprotected; the deploy does not warn
+  # you, so check the FrontendWebAclArn output is not empty.
+  InUsEast1:            !Equals [!Ref 'AWS::Region', 'us-east-1']
+
+# SECURITY-SCANNER TRIAGE - read docs/SECURITY-FINDINGS.md before "fixing" any
+# suppression below. One class is worth repeating, because complying would break the
+# control this system provides: W28, explicit resource names. Enforcement is wired by
+# NAME across a stack boundary - let CloudFormation generate those names and the
+# backend can no longer suspend anybody.
+
+Resources:
+
+  # 0. PLATFORM - encryption. One CMK for the domain's home EFS and all three tables.
+  #
+  # LOAD-BEARING FOR RECOVERY: scheduling its deletion makes the tables unreadable,
+  # their PITR useless and every student's notebooks unrecoverable. Hence the 30-day
+  # window rather than the 7-day minimum.
+
+  PlatformKey:
+    Type: AWS::KMS::Key
+    # Teardown leaves nothing billable; the 30-day window above is the safety net.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: gpu-guardian - CMK for the Studio domain home EFS and the three admin DynamoDB tables
+      Enabled: true
+      EnableKeyRotation: true
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Account-root base policy, deliberately the only statement. No service
+          # principals: SageMaker and DynamoDB each grant as the DEPLOYING identity, so a
+          # deploy role without kms:CreateGrant cannot create the domain.
+          #
+          # kms:* to the account root is the default key policy AWS itself creates, and
+          # it exists to prevent lockout: a key whose policy names no usable principal
+          # cannot be administered by anyone, including you, and cannot be recovered.
+          # Read it as a CEILING, not a grant - it delegates authority to IAM rather
+          # than handing anything to a caller, so no principal can use this key unless
+          # an IAM identity policy also allows it. That is where least privilege is
+          # enforced: keep the identity policies narrow (see AdminBackendFunctionRole,
+          # which holds only Encrypt/Decrypt/GenerateDataKey* on this key ARN) and do
+          # NOT widen this statement or add principals to it.
+          # https://docs.aws.amazon.com/kms/latest/developerguide/key-policy-default.html
+          - Sid: AccountRootDelegatesToIam
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+  PlatformKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/gpu-guardian
+      TargetKeyId: !Ref PlatformKey
+
+  # 1. PLATFORM - networking
+
+  # Exists only because StudioDomain requires VpcId + SubnetIds even under
+  # PublicInternetOnly, where no notebook traffic routes through it. The only ENI here
+  # is the EFS mount target, which is what justifies the suppressions below. NONE OF
+  # THAT HOLDS UNDER VpcOnly.
+  Vpc:
+    Type: AWS::EC2::VPC
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W60
+            reason: "No flow logs: under PublicInternetOnly no notebook traffic traverses this VPC - the only ENI in it is the domain's EFS mount target, so a flow log would record NFS mount chatter and nothing else"
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: gpu-guardian-vpc
+        - Key: CostCenter
+          Value: SageMaker-GPU-Guardian
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: gpu-guardian-igw
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      # false: nothing is launched here, and EFS mount targets take no public IP
+      # either way. Mutable, so flipping it needs no replacement.
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: gpu-guardian-public-subnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: gpu-guardian-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # 2. PLATFORM - IAM Identity Center federation surface. ORGANIZATION-only, so an
+  # ACCOUNT deploy is not forced to supply an instance ARN it never uses. Group
+  # membership comes from the institution's IdP sync; this creates what it attaches to.
+
+  StudentGroup:
+    Type: AWS::IdentityStore::Group
+    Condition: IsOrgInstance
+    Metadata:
+      # W1030 is unreachable: IsOrgInstance excludes the '' default, but cfn-lint
+      # resolves defaults without evaluating conditions.
+      cfn-lint:
+        config:
+          ignore_checks: [W1030]
+    Properties:
+      IdentityStoreId: !Ref IdentityStoreId
+      DisplayName: SageMaker-GPU-Guardian-Students
+      Description: Students enrolled in the GPU computing module, one trimester at a time.
+
+  # ORGANIZATION-only: permission sets are unsupported on account instances and
+  # creating one there fails the whole stack. ACCOUNT mode's equivalent grant lives on
+  # each student's own execution role.
+  StudentPermissionSet:
+    Type: AWS::SSO::PermissionSet
+    Condition: IsOrgInstance
+    Metadata:
+      # W1030 is unreachable: IsOrgInstance excludes the '' default, but cfn-lint
+      # resolves defaults without evaluating conditions.
+      cfn-lint:
+        config:
+          ignore_checks: [W1030]
+    Properties:
+      Name: GpuGuardianStudent
+      InstanceArn: !Ref IdentityCenterInstanceArn
+      Description: Minimum access for a student to open their own Studio notebook. No console/EC2/IAM access.
+      SessionDuration: PT8H
+      InlinePolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: OpenOwnStudioApp
+            Effect: Allow
+            Action:
+              - sagemaker:CreatePresignedDomainUrl
+              - sagemaker:DescribeUserProfile
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:user-profile/*'
+
+  StudentAssignment:
+    Type: AWS::SSO::Assignment
+    Condition: IsOrgInstance
+    Metadata:
+      # W1030 is unreachable: IsOrgInstance excludes the '' default, but cfn-lint
+      # resolves defaults without evaluating conditions.
+      cfn-lint:
+        config:
+          ignore_checks: [W1030]
+    Properties:
+      InstanceArn: !Ref IdentityCenterInstanceArn
+      PermissionSetArn: !GetAtt StudentPermissionSet.PermissionSetArn
+      PrincipalId: !GetAtt StudentGroup.GroupId
+      PrincipalType: GROUP
+      TargetId: !Ref AWS::AccountId
+      TargetType: AWS_ACCOUNT
+
+  # 3. PLATFORM - notebook frontend
+
+  DomainExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name is deliberate - see the SECURITY-SCANNER TRIAGE block above Resources"
+    Properties:
+      RoleName: gpu-guardian-domain-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+
+  DomainExecutionRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: MinimalStudioLogging
+      Roles:
+        - !Ref DomainExecutionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sagemaker/*'
+          # Required by KmsKeyId on StudioDomain: a role that cannot use the key cannot
+          # start a Space, and nothing fails until somebody opens a notebook.
+          #
+          # Do NOT add conditions - kms:GrantIsForAWSResource and kms:ViaService were
+          # both tried and each DENIES Space creation. The trust policy is what bounds
+          # the unconditional CreateGrant.
+          #
+          # This is the DEFAULT role, NOT the statement that fixes a student; that is
+          # the per-student -exec-role. docs/DEPLOYMENT.md, "Notebooks will not start".
+          - Sid: UseStorageEncryptionKey
+            Effect: Allow
+            Action:
+              - kms:CreateGrant
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:GenerateDataKey
+              - kms:GenerateDataKeyWithoutPlaintext
+            Resource: !GetAtt PlatformKey.Arn
+
+  # STOP. KmsKeyId below is CREATE-ONLY. Never add, change or remove it on a domain
+  # that already exists. The change set says Replacement: True, and the replacement
+  # CANNOT EXECUTE - it collides with the live domain on DomainName. The rollback then
+  # strands the tables on a CMK they can no longer reach, because SSE changes do not
+  # roll back. "Accept the loss of the notebooks" is NOT an option; the update fails
+  # either way. Both recovery paths: docs/SETUP.md, "What you cannot change later".
+  StudioDomain:
+    Type: AWS::SageMaker::Domain
+    Properties:
+      DomainName: gpu-guardian
+      # The CMK for the home EFS holding every student's notebooks. See the warning above.
+      KmsKeyId: !GetAtt PlatformKey.Arn
+      # SSO is only reachable on an ORGANIZATION instance - the Studio managed
+      # application is not integrated with account instances. ACCOUNT mode gets IAM,
+      # where the backend mints presigned URLs instead.
+      #
+      # IMMUTABLE: changing this replaces the domain and every UserProfile in it,
+      # which is why IdentityCenterInstanceType has no default.
+      AuthMode: !If [IsOrgInstance, SSO, IAM]
+      AppNetworkAccessType: PublicInternetOnly
+      VpcId: !Ref Vpc
+      SubnetIds:
+        - !Ref PublicSubnet
+      DefaultUserSettings:
+        ExecutionRole: !GetAtt DomainExecutionRole.Arn
+      # No property controls EFS retention on delete, so a teardown always leaves the
+      # home filesystem, its ENI and two NFS security groups behind - and all three
+      # block the VPC delete. Cleanup script: docs/DEPLOYMENT.md, Teardown step 2.
+      Tags:
+        - Key: CostCenter
+          Value: SageMaker-GPU-Guardian
+
+  # 4. PLATFORM - CLASS-WIDE pool backstop and cost anomaly detection. The pool is
+  # _check_class_pool() in the backend, not a resource, and it is notify-only. It sums
+  # metered compute, so CostAnomalySubscription below is the only thing here watching
+  # real billing data.
+
+  CostAnomalyMonitor:
+    Type: AWS::CE::AnomalyMonitor
+    Condition: CreateAnomalyMonitor
+    Properties:
+      MonitorName: gpu-guardian-anomaly-monitor
+      MonitorType: DIMENSIONAL
+      MonitorDimension: SERVICE
+
+  CostAnomalySubscription:
+    Type: AWS::CE::AnomalySubscription
+    Condition: CreateAnomalyMonitor
+    Properties:
+      SubscriptionName: gpu-guardian-anomaly-subscription
+      Frequency: DAILY
+      MonitorArnList:
+        - !Ref CostAnomalyMonitor
+      Subscribers:
+        - Type: EMAIL
+          Address: !Ref NotificationEmail
+      ThresholdExpression: '{"Dimensions":{"Key":"ANOMALY_TOTAL_IMPACT_ABSOLUTE","MatchOptions":["GREATER_THAN_OR_EQUAL"],"Values":["20"]}}'
+
+  # 5. CONSOLE - bootstrap config. SSM rather than Lambda environment variables so ops
+  # can repoint one with ssm:PutParameter, no stack update needed.
+
+  ExistingDomainIdParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /gpu-guardian-admin/existing-domain-id
+      Type: String
+      Value: !Ref StudioDomain
+      Description: Studio domain the console creates each student's UserProfile in.
+
+  # ORGANIZATION-only, these and StudentGroupIdParam: an SSM parameter with an empty
+  # Value is rejected, and ACCOUNT mode has nothing to write. The backend reads them
+  # through ssm_get_optional, which tolerates their absence.
+  IdentityCenterInstanceArnParam:
+    Type: AWS::SSM::Parameter
+    Condition: IsOrgInstance
+    Properties:
+      Name: /gpu-guardian-admin/identity-center-instance-arn
+      Type: String
+      Value: !Ref IdentityCenterInstanceArn
+
+  IdentityStoreIdParam:
+    Type: AWS::SSM::Parameter
+    Condition: IsOrgInstance
+    Properties:
+      Name: /gpu-guardian-admin/identity-store-id
+      Type: String
+      Value: !Ref IdentityStoreId
+
+  NotificationEmailDefaultParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /gpu-guardian-admin/notification-email-default
+      Type: String
+      Value: !Ref NotificationEmail
+
+  TemplateS3UrlParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /gpu-guardian-admin/template-s3-url
+      Type: String
+      # Knowable at create time, but the object still has to be uploaded before the
+      # first student is added.
+      Value: !Sub 'https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/${StudentTemplateS3Key}'
+      Description: S3 URL of the uploaded, unmodified per-student template.
+
+  StorageKmsKeyArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /gpu-guardian-admin/storage-kms-key-arn
+      Type: String
+      Value: !GetAtt PlatformKey.Arn
+      # How the per-student stack learns the key ARN - it has no other route to it,
+      # and an alias will not match in an IAM Resource. Withhold it and every
+      # student's first notebook fails with "Unable to create EBS volume".
+      Description: ARN of the platform CMK that encrypts Studio Space volumes and the state tables.
+
+  StudentGroupIdParam:
+    Type: AWS::SSM::Parameter
+    Condition: IsOrgInstance
+    Properties:
+      Name: /gpu-guardian-admin/student-group-id
+      Type: String
+      Value: !GetAtt StudentGroup.GroupId
+      Description: The IdC group, created above, that new students get added to. ORGANIZATION-only - in ACCOUNT mode neither the group nor this parameter exists, and Cognito's student group takes its place.
+
+  # 6. CONSOLE - provisioning. One per-student stack per student, launched by the
+  # backend on demand. Also holds the shared access-log bucket, written to by both S3
+  # buckets here and by the CloudFront distribution in section 12.
+
+  # One bucket for every access log this stack produces, under three prefixes.
+  #
+  # THE SELF-REFERENCE BELOW IS DELIBERATE - unlogged, this bucket fails the same
+  # CKV_AWS_18 as the other two, so the finding would move rather than close. That
+  # feedback loop is why the lifecycle rule is not optional, and a literal !Sub is
+  # used because a resource cannot !Ref itself. IF THE BucketName CHANGES, CHANGE
+  # IT IN BOTH PLACES.
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    # Teardown destroys the access log along with everything it describes. If these
+    # logs are evidence for anyone, set Retain and drop LogsBucketCleanup.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub 'gpu-guardian-admin-logs-${AWS::AccountId}'
+      # AES256, and NEVER the CMK from section 0: CloudFront standard logging cannot
+      # deliver to a bucket whose default encryption is SSE-KMS. SSE-S3 has applied by
+      # default since January 2023, so this block only states what is already true -
+      # but stating it is what keeps the scanners quiet without a suppression.
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # ACLs must stay enabled: BucketOwnerEnforced breaks CloudFront standard logging,
+      # which has no policy equivalent. BucketOwnerPreferred is the weakest that works.
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          # 90 days, which also bounds the self-logging feedback loop above.
+          - Id: ExpireLogs
+            Status: Enabled
+            ExpirationInDays: 90
+            # Versioning exists only for the scanner; nothing overwrites a log object.
+            NoncurrentVersionExpirationInDays: 7
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      LoggingConfiguration:
+        DestinationBucketName: !Sub 'gpu-guardian-admin-logs-${AWS::AccountId}'
+        LogFilePrefix: s3-access-logs/logs/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # One grant, one deny. The grant authorises S3 access log delivery via policy
+  # rather than a LogDeliveryWrite ACL (AccessControl is legacy, cfn-lint W3045).
+  # CloudFront is deliberately absent - it writes its own bucket ACL, which is why
+  # ObjectOwnership must stay BucketOwnerPreferred.
+  LogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F16
+            reason: "Principal '*' appears only on the DenyNonTlsRequests statement, where denying every principal is the intent. The Allow statement names logging.s3.amazonaws.com and is scoped to this account, to buckets named by this stack, and to the s3-access-logs/ prefix."
+    Properties:
+      Bucket: !Ref LogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3ServerAccessLogDelivery
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${LogsBucket.Arn}/s3-access-logs/*'
+            # Confused-deputy guard; without it any bucket anywhere could write here.
+            # Literal rather than GetAtt because one of the three buckets IS this one.
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:s3:::gpu-guardian-admin-*-${AWS::AccountId}'
+          - Sid: DenyNonTlsRequests
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt LogsBucket.Arn
+              - !Sub '${LogsBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  TemplatesBucket:
+    Type: AWS::S3::Bucket
+    # Emptied by TemplatesBucketCleanup first. Spelled out because Delete-by-default
+    # is easy to misread as an oversight.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W51
+            reason: "The bucket policy below grants nothing - it only denies non-TLS requests. Access is granted identity-side: PublicAccessBlockConfiguration blocks all four public vectors and the only principals with s3:GetObject are AdminBackendFunctionRole and StudentStackDeployRole"
+    Properties:
+      BucketName: !Sub 'gpu-guardian-admin-templates-${AWS::AccountId}'
+      # Already the effective default since January 2023; stated so the scanners see it.
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      # Object-level reads of the template and handler. CloudTrail S3 data events are
+      # off by default and chargeable; this is neither.
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LogsBucket
+        LogFilePrefix: s3-access-logs/templates/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Deny-only: it grants nothing, and access control here is identity-side. Its job is
+  # to refuse non-TLS requests, the one thing an identity policy cannot express for a
+  # caller outside this account.
+  TemplatesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F16
+            reason: "Principal '*' on a Deny statement is the required form: the point is to deny EVERY principal that connects without TLS, including ones this account has never heard of. Narrowing the principal would narrow what gets denied."
+    Properties:
+      Bucket: !Ref TemplatesBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonTlsRequests
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt TemplatesBucket.Arn
+              - !Sub '${TemplatesBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  # CloudFormation assumes this (via RoleARN) to create the per-student resources, so
+  # the backend's own role needs only CreateStack + PassRole on this one role rather
+  # than the underlying permissions. Scoped to the per-student name prefixes.
+  StudentStackDeployRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name is deliberate - see the SECURITY-SCANNER TRIAGE block above Resources"
+    Properties:
+      RoleName: gpu-guardian-admin-student-stack-deploy-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DeployPerStudentResources
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: IamRolesAndPolicies
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:TagRole
+                Resource: 'arn:aws:iam::*:role/gpu-guardian-*'
+              - Sid: IamManagedPolicy
+                Effect: Allow
+                Action:
+                  - iam:CreatePolicy
+                  - iam:DeletePolicy
+                  - iam:GetPolicy
+                  - iam:ListPolicyVersions
+                  - iam:TagPolicy
+                Resource: 'arn:aws:iam::*:policy/gpu-guardian-*'
+              - Sid: PassRoleToServicesTheStudentTemplateUses
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: 'arn:aws:iam::*:role/gpu-guardian-*'
+                Condition:
+                  StringEquals:
+                    iam:PassedToService:
+                      - sagemaker.amazonaws.com
+                      - lambda.amazonaws.com
+              - Sid: SageMakerUserProfile
+                Effect: Allow
+                Action:
+                  - sagemaker:CreateUserProfile
+                  - sagemaker:DeleteUserProfile
+                  - sagemaker:AddTags
+                  - sagemaker:DescribeUserProfile
+                Resource: 'arn:aws:sagemaker:*:*:user-profile/*'
+              - Sid: StudentStackLambdas
+                # stop-app (invoked at the cap) and studio-cleanup (clears Spaces
+                # before the UserProfile is deleted).
+                Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - lambda:TagResource
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  # Custom resources are invoked using the stack's RoleARN - this role.
+                  # Without it studio-cleanup fails on create AND delete, making the
+                  # teardown it exists to fix worse than no teardown at all.
+                  - lambda:InvokeFunction
+                Resource: 'arn:aws:lambda:*:*:function:gpu-guardian-*'
+              - Sid: StudentStackLambdaLogGroups
+                # A hard requirement, not an optimisation: 04 declares its two log
+                # groups explicitly, and without this the student stack fails at
+                # CREATE_IN_PROGRESS on the first one. Scoped by name prefix so it
+                # cannot reach the platform's own groups.
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:DescribeLogGroups
+                  - logs:PutRetentionPolicy
+                  - logs:DeleteRetentionPolicy
+                  - logs:TagResource
+                  - logs:UntagResource
+                  - logs:ListTagsForResource
+                Resource: 'arn:aws:logs:*:*:log-group:/aws/lambda/gpu-guardian-*'
+              - Sid: ReadTheTemplateItDeploys
+                # TemplateURL is fetched as this RoleARN; without it CreateStack fails
+                # at GetObject before it ever evaluates the template.
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${TemplatesBucket.Arn}/*'
+
+  # 7. CONSOLE - auth. Under ORGANIZATION Cognito is only a SAML-to-session bridge;
+  # under ACCOUNT it IS the identity source. Same pool, client and authorizer either
+  # way - only the cognito:groups claim tells an admin from a student.
+
+  # ORGANIZATION-only: the group the SAML application is assigned to. ACCOUNT mode
+  # reads CognitoAdminGroup below instead.
+  AdminGroup:
+    Type: AWS::IdentityStore::Group
+    Condition: IsOrgInstance
+    Metadata:
+      # W1030 is unreachable: IsOrgInstance excludes the '' default, but cfn-lint
+      # resolves defaults without evaluating conditions.
+      cfn-lint:
+        config:
+          ignore_checks: [W1030]
+    Properties:
+      # Straight off the parameter: the identity store is an input to this stack.
+      IdentityStoreId: !Ref IdentityStoreId
+      DisplayName: SageMaker-GPU-Guardian-Admins
+      Description: Ops admins for this console - assign this group to the IdC SAML application so only its members can sign in.
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: gpu-guardian-admin-console
+      # Self-registration off. Cognito defaults this to false, which leaves the public
+      # SignUp API open on the hosted UI: anyone who finds the domain can create an
+      # account in the pool. Such an account lands in no group, so it cannot reach an
+      # admin route and has no student record to resolve to - but it does hold a valid
+      # JWT, and the pool is meant to hold exactly the roster the console created.
+      # Every real user arrives through AdminCreateUser (ACCOUNT mode) or SAML
+      # federation (ORGANIZATION mode), so nothing here needs SignUp.
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+        - Name: name
+          Required: false
+          Mutable: true
+
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub 'gpu-guardian-admin-${AWS::AccountId}'
+      UserPoolId: !Ref CognitoUserPool
+
+  # Unconditional in both modes - the only authorization signal in ACCOUNT mode, and
+  # harmless in ORGANIZATION. Creating them either way keeps one backend code path.
+  CognitoAdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: gpu-guardian-admins
+      UserPoolId: !Ref CognitoUserPool
+      Description: Members may call every admin route. ACCOUNT mode - add your ops staff here by hand after the deploy.
+      Precedence: 0
+
+  CognitoStudentGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: gpu-guardian-students
+      UserPoolId: !Ref CognitoUserPool
+      # Grants exactly one thing: a presigned URL for the caller's OWN UserProfile.
+      Description: Students provisioned by the console. ACCOUNT mode - populated automatically by the backend.
+      Precedence: 10
+
+  CognitoSamlIdentityProvider:
+    Type: AWS::Cognito::UserPoolIdentityProvider
+    Condition: UseSamlFederation
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      ProviderName: IdentityCenter
+      ProviderType: SAML
+      ProviderDetails:
+        MetadataURL: !Ref IdcSamlMetadataUrl
+      AttributeMapping:
+        email: email
+        name: name
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: gpu-guardian-admin-console-client
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      CallbackURLs:
+        - !Sub 'https://${FrontendDistribution.DomainName}/'
+        - http://localhost:5173/
+      LogoutURLs:
+        - !Sub 'https://${FrontendDistribution.DomainName}/'
+        - http://localhost:5173/
+      # !Ref returns the ProviderName, used instead of the bare string so CloudFormation
+      # orders the client after the provider; DependsOn cannot express this on a
+      # conditional resource (E3005). COGNITO is the local path: ACCOUNT mode, and an
+      # ORGANIZATION deploy's first pass.
+      SupportedIdentityProviders: !If
+        - UseSamlFederation
+        - [!Ref CognitoSamlIdentityProvider]
+        - [COGNITO]
+
+  # 8. CONSOLE - alerting and state. One topic, one subscription, one confirmation
+  # click no matter how many students get added - 04 creates no topic of its own.
+
+  AdminAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: gpu-guardian-admin-alerts
+      DisplayName: SageMaker GPU Guardian - Admin Alerts
+      # At-rest encryption; message bodies name students and their spend. Needs
+      # EncryptAlertsAtRest on the backend role to match, or every publish fails
+      # KMSAccessDeniedException - silencing the breach alerts this exists to send.
+      KmsMasterKeyId: alias/aws/sns
+
+  AdminAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AdminAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AdminNotificationEmail
+
+  StudentsTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name is deliberate - see the SECURITY-SCANNER TRIAGE block above Resources"
+    Properties:
+      TableName: gpu-guardian-admin-students
+      BillingMode: PAY_PER_REQUEST
+      # SSEType KMS is what makes this "customer-managed"; omit KMSMasterKeyId and it
+      # silently reverts to aws/dynamodb. Pairs with EncryptStateTables on the backend role.
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref PlatformKey
+      # This table IS the roster: caps, status and enforcement handles. Losing it
+      # means re-enrolling by hand and losing the record of who is ON_HOLD.
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: studentId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: studentId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  # One row per threshold crossing, so the alerts page has an audit trail rather
+  # than only "latest status".
+  AlarmEventsTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name is deliberate - see the SECURITY-SCANNER TRIAGE block above Resources"
+    Properties:
+      TableName: gpu-guardian-admin-alarm-events
+      BillingMode: PAY_PER_REQUEST
+      # SSEType KMS is what makes this "customer-managed"; omit KMSMasterKeyId and it
+      # silently reverts to aws/dynamodb. Pairs with EncryptStateTables on the backend role.
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref PlatformKey
+      # PITR because this table is evidence, and evidence that can be lost without
+      # trace is not evidence.
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+
+  # THE cap: every dollar figure the console shows derives from this table. Schema,
+  # and why the meter is idempotent: docs/ARCHITECTURE.md section 1.
+  #
+  # DeletionPolicy Delete is deliberate - metering data for a teaching lab, not a
+  # financial record. If it ever needs to be one, set Retain and drop the TTL.
+  UsageLedgerTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name is deliberate - see the SECURITY-SCANNER TRIAGE block above Resources"
+    Properties:
+      TableName: gpu-guardian-admin-usage-ledger
+      BillingMode: PAY_PER_REQUEST
+      # SSEType KMS is what makes this "customer-managed"; omit KMSMasterKeyId and it
+      # silently reverts to aws/dynamodb. Pairs with EncryptStateTables on the backend role.
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref PlatformKey
+      # PITR matters most here. This table IS the cap, so an accidental delete does
+      # not lose reporting data - it silently resets every student's spend to zero
+      # and un-enforces every cap already hit, and nothing else can reconstruct the
+      # totals. PERIOD rows carry no TTL, which is what makes a restore useful.
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: studentId
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: studentId
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      # Session rows expire after 120 days; PERIOD rows deliberately never do.
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  # Append-only audit of every metering decision - the evidence behind every
+  # suspension, kept separate so it outlives the Lambda's operational logs.
+  #
+  # THE TRAP with RetainExceptOnCreate, which all four log groups here carry: teardown
+  # leaves them in the account and the next deploy CANNOT adopt them - create-stack
+  # fails on AWS::EarlyValidation::ResourceExistenceCheck. A redeploy MUST delete them
+  # first. docs/DEPLOYMENT.md, "What survives on purpose - and blocks the next deploy".
+  ConsumptionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "CloudWatch Logs has no AWS-managed-key option, so KmsKeyId means creating and owning a CMK - see TRIAGE block. Contents are metering decisions: student id, seconds, rate, dollars."
+      checkov:
+        skip:
+          - id: "CKV_AWS_158"
+            comment: "Encrypted with the CloudWatch Logs service key; a CMK is not justified - see TRIAGE block"
+    Properties:
+      LogGroupName: /gpu-guardian/consumption
+      RetentionInDays: 365
+
+  AdminBackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "CloudWatch Logs has no AWS-managed-key option - see TRIAGE block"
+      checkov:
+        skip:
+          - id: "CKV_AWS_158"
+            comment: "Encrypted with the CloudWatch Logs service key; a CMK is not justified - see TRIAGE block"
+    Properties:
+      LogGroupName: /aws/lambda/gpu-guardian-admin-backend
+      RetentionInDays: 90
+
+  # 9. CONSOLE - backend. One Lambda serves every route and every scheduled job,
+  # dispatching on event shape inside handler().
+
+  AdminBackendFunctionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name is deliberate - see the SECURITY-SCANNER TRIAGE block above Resources"
+          - id: W11
+            reason: "Two statements use Resource '*' and both are forced to: ReadComputeStatus (sagemaker:ListApps/ListSpaces support no resource-level ARNs) and EncryptAlertsAtRest (the kms grant is scoped by the kms:ViaService condition key instead, because the SNS topic's key is resolved at publish time). Each is annotated at its own Sid. Every other statement in this policy is scoped to a specific ARN or ARN pattern - including ManageStudentIdcIdentities, which was in this list until 2026-08-26."
+          - id: W76
+            reason: "SPCM 25+ is a complexity metric, not a permission finding. The count is high because this policy is deliberately split into 14 narrowly-scoped Sids with one purpose each rather than a few broad ones - collapsing them to satisfy the metric would widen the grants."
+    Properties:
+      RoleName: gpu-guardian-admin-backend-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AdminBackendPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Sid: Logging
+              Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/gpu-guardian-admin-backend:*'
+            - Sid: StateTables
+              # DescribeTable is what the preflight probes; the rest is the row surface.
+              Effect: Allow
+              Action:
+                - dynamodb:DescribeTable
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+                - dynamodb:Query
+                - dynamodb:Scan
+                - dynamodb:BatchGetItem
+                - dynamodb:BatchWriteItem
+                - dynamodb:ConditionCheckItem
+              Resource:
+                - !GetAtt StudentsTable.Arn
+                - !Sub '${StudentsTable.Arn}/index/*'
+                - !GetAtt AlarmEventsTable.Arn
+                - !GetAtt UsageLedgerTable.Arn
+            - Sid: EncryptStateTables
+              # Required by SSEType KMS on the three tables: without it every read and
+              # write fails AccessDeniedException - no metering, no suspensions.
+              # kms:CreateGrant is deliberately absent, and kms:ViaService pins this to
+              # DynamoDB so it cannot reach the home EFS the same key protects.
+              Effect: Allow
+              Action:
+                - kms:Encrypt
+                - kms:Decrypt
+                - kms:ReEncrypt*
+                - kms:GenerateDataKey*
+                - kms:DescribeKey
+              Resource: !GetAtt PlatformKey.Arn
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub 'dynamodb.${AWS::Region}.amazonaws.com'
+            - Sid: WriteConsumptionAudit
+              # The metering audit trail. No Delete* action by design: the process that
+              # writes the record settling a billing dispute must not be able to erase
+              # it. CreateLogStream because the writer opens one stream per cold start.
+              Effect: Allow
+              Action:
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - logs:DescribeLogStreams
+              Resource: !Sub '${ConsumptionLogGroup.Arn}:*'
+            - Sid: LoadHandlerSource
+              # The inline loader below fetches the handler on cold start.
+              Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub '${TemplatesBucket.Arn}/*'
+            - Sid: ProvisionPerStudentStacks
+              Effect: Allow
+              Action:
+                - cloudformation:CreateStack
+                - cloudformation:DeleteStack
+                - cloudformation:DescribeStacks
+              Resource: !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/gpu-guardian-student-*/*'
+            - Sid: PassStackDeployRole
+              Effect: Allow
+              Action: iam:PassRole
+              Resource: !GetAtt StudentStackDeployRole.Arn
+              Condition:
+                StringEquals:
+                  iam:PassedToService: cloudformation.amazonaws.com
+            - Sid: ReadBootstrapConfig
+              Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/gpu-guardian-admin/*'
+            - Sid: ReadTemplateForCreateStackCall
+              # TemplateURL is fetched as the CALLER (this function); RoleARN covers
+              # only the resources inside the template. Needed in both places.
+              Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub '${TemplatesBucket.Arn}/*'
+            - Sid: ManageStudentIdcIdentities
+              # Creates and removes a student's IdC identity and group membership. The
+              # !If is load-bearing: IdentityStoreId is empty in ACCOUNT mode and an
+              # unguarded !Sub emits an ARN IAM rejects at deploy time. Why the remaining
+              # wildcards cannot be narrowed: docs/SECURITY-FINDINGS.md.
+              #
+              # DEAD CODE in ACCOUNT mode; kept so ORGANIZATION works unmodified.
+              Effect: Allow
+              Action:
+                - identitystore:GetUserId
+                - identitystore:CreateUser
+                - identitystore:DeleteUser
+                - identitystore:CreateGroupMembership
+                - identitystore:DeleteGroupMembership
+                - identitystore:ListGroupMembershipsForMember
+                - identitystore:IsMemberInGroups
+                - identitystore:DescribeUser
+              Resource:
+                - !If
+                  - IsOrgInstance
+                  - !Sub 'arn:${AWS::Partition}:identitystore::${AWS::AccountId}:identitystore/${IdentityStoreId}'
+                  - !Sub 'arn:${AWS::Partition}:identitystore::${AWS::AccountId}:identitystore/*'
+                - !Sub 'arn:${AWS::Partition}:identitystore:::user/*'
+                - !Sub 'arn:${AWS::Partition}:identitystore:::group/*'
+                - !Sub 'arn:${AWS::Partition}:identitystore:::membership/*'
+            - Sid: ManageStudentCognitoIdentities
+              # ACCOUNT mode's counterpart to ManageStudentIdcIdentities, and also the
+              # per-request authorization read. Scoped to this stack's user pool -
+              # unlike Identity Store, Cognito supports a resource ARN.
+              Effect: Allow
+              Action:
+                - cognito-idp:AdminCreateUser
+                - cognito-idp:AdminDeleteUser
+                - cognito-idp:AdminGetUser
+                - cognito-idp:AdminAddUserToGroup
+                - cognito-idp:AdminRemoveUserFromGroup
+                - cognito-idp:AdminListGroupsForUser
+                - cognito-idp:ListUsers
+                # Read-only, for job_directory_audit: it reports orphaned logins,
+                # it never deletes one.
+                - cognito-idp:ListUsersInGroup
+              Resource: !GetAtt CognitoUserPool.Arn
+            - Sid: MintStudentStudioUrl
+              # ACCOUNT mode in practice: no IdC portal tile, so GET /me/studio-url
+              # mints a presigned URL. Scoped to this domain, and the handler pins the
+              # profile to the caller's own record - no minting into another student's
+              # notebook.
+              Effect: Allow
+              Action:
+                - sagemaker:CreatePresignedDomainUrl
+                - sagemaker:DescribeUserProfile
+              Resource: !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:user-profile/${StudioDomain}/*'
+            - Sid: ReadComputeStatus
+              # Neither action supports resource-level ARNs; both are read-only.
+              # ListSpaces is not redundant: an app inside a Space reports
+              # UserProfileName as null and is invisible to list_apps(), so without
+              # it compute_status reports STOPPED over a live notebook.
+              Effect: Allow
+              Action:
+                - sagemaker:ListApps
+                - sagemaker:ListSpaces
+              Resource: '*'
+            - Sid: PublishConsolidatedAlerts
+              Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref AdminAlertsTopic
+            - Sid: EncryptAlertsAtRest
+              # Required by KmsMasterKeyId on AdminAlertsTopic: without it every
+              # publish, breach alerts included, fails KMSAccessDeniedException.
+              # kms:ViaService is what bounds the Resource '*' - the AWS-managed alias
+              # has no stable ARN to name.
+              Effect: Allow
+              Action:
+                - kms:GenerateDataKey
+                - kms:Decrypt
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub 'sns.${AWS::Region}.amazonaws.com'
+            - Sid: SuspendResume
+              # THE enforcement grant - the only statement in the system that can
+              # stop a student at the cap. Remove it and students become uncapped.
+              # Scoped two ways at once: only gpu-guardian-*-exec-role roles, and
+              # only the *-deny-new-apps policy.
+              Effect: Allow
+              Action:
+                - iam:AttachRolePolicy
+                - iam:DetachRolePolicy
+              Resource: 'arn:aws:iam::*:role/gpu-guardian-*-exec-role'
+              Condition:
+                ArnLike:
+                  iam:PolicyARN: 'arn:aws:iam::*:policy/gpu-guardian-*-deny-new-apps'
+            - Sid: StopRunningSession
+              # The other half of enforcement: the deny policy blocks NEW sessions and
+              # deliberately omits sagemaker:Delete*, so this function is what stops the
+              # notebook already running.
+              Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: 'arn:aws:lambda:*:*:function:gpu-guardian-*-stop-app'
+
+  AdminBackendFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Backend only calls public AWS APIs (CloudFormation, DynamoDB, SageMaker, Logs, IdC) - no VPC resources to reach"
+      checkov:
+        skip:
+          - id: "CKV_AWS_117"
+            comment: "Backend only calls public AWS APIs - no VPC resources to reach"
+          - id: "CKV_AWS_173"
+            comment: "Environment variables hold table names, log group names, a bucket name and numeric thresholds - no secrets. Already encrypted at rest under the AWS-managed Lambda key; the rule asks for a CMK. See TRIAGE block."
+    Properties:
+      FunctionName: gpu-guardian-admin-backend
+      # Names the log group explicitly rather than relying on Lambda's implicit
+      # /aws/lambda/<FunctionName>. Both resolve to the same group, but declaring it
+      # makes CloudFormation order the group before the function and makes the
+      # association reviewable in the template instead of inferable from a naming
+      # convention. It also means a rename cannot silently orphan the retention policy.
+      LoggingConfig:
+        LogGroup: !Ref AdminBackendLogGroup
+      # Where a failed async invocation goes. usage_sync IS the cap, so without this a
+      # sweep that fails twice disappears silently and students run uncapped. The DLQ
+      # catches individual failures; the alarms below catch the pattern.
+      DeadLetterConfig:
+        TargetArn: !Ref AdminAlertsTopic
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Role: !GetAtt AdminBackendFunctionRole.Arn
+      # 120s, not 30s: usage_sync walks the whole roster, and a sweep that times out
+      # is a sweep that does not enforce. Comfortable at 30 students.
+      Timeout: 120
+      MemorySize: 256
+      # A ceiling against a runaway retry loop, not a throughput target.
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          # Names this stack's own SSM paths and per-student stack names.
+          ADMIN_PREFIX: gpu-guardian
+          CODE_BUCKET: !Ref TemplatesBucket
+          CODE_S3_KEY: !Ref BackendScriptS3Key
+          STUDENTS_TABLE_NAME: !Ref StudentsTable
+          ALARM_EVENTS_TABLE_NAME: !Ref AlarmEventsTable
+          # --- Metering and enforcement -----------------------------------
+          # Both required (MISSING_ENV): failing at import beats running a sweep that
+          # silently bills nothing.
+          USAGE_LEDGER_TABLE_NAME: !Ref UsageLedgerTable
+          CONSUMPTION_LOG_GROUP: !Ref ConsumptionLogGroup
+          CLASS_POOL_CAP_USD: !Ref ClassPoolCapUsd
+          # Must stay in step with PeriodicSweepRule below; students are shown this
+          # as enforcementLagMinutes.
+          SWEEP_MINUTES: !Ref SweepMinutes
+          # --- Branding, returned by the unauthenticated GET /init ---------
+          # Empty strings are meaningful: the handler owns the fallback defaults.
+          APP_TITLE: !Ref AppTitle
+          APP_SHORT_NAME: !Ref AppShortName
+          APP_LOGO_URL: !Ref AppLogoUrl
+          APP_FAVICON_URL: !Ref AppFaviconUrl
+          APP_PRIMARY_COLOR: !Ref AppPrimaryColor
+          APP_INSTITUTION_NAME: !Ref AppInstitutionName
+          APP_SUPPORT_EMAIL: !Ref AppSupportEmail
+          FRONTEND_URL: !Sub 'https://${FrontendDistribution.DomainName}'
+          STUDENT_STACK_DEPLOY_ROLE_ARN: !GetAtt StudentStackDeployRole.Arn
+          ADMIN_ACCOUNT_ID: !Ref AWS::AccountId
+          ADMIN_ALERTS_TOPIC_ARN: !Ref AdminAlertsTopic
+          # Empty in ACCOUNT mode; the handler requires it only under ORGANIZATION.
+          ADMIN_GROUP_ID: !If [IsOrgInstance, !GetAtt AdminGroup.GroupId, '']
+          # IDENTITY_MODE decides whether the roster lives in IdC or Cognito.
+          # DOMAIN_AUTH_MODE passes through to each student stack, whose UserProfile may
+          # carry SingleSignOnUser* only under SSO. Environment, not SSM: both are fixed
+          # by the domain, so making them tunable would only let them drift.
+          IDENTITY_MODE: !Ref IdentityCenterInstanceType
+          DOMAIN_AUTH_MODE: !If [IsOrgInstance, SSO, IAM]
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+          COGNITO_ADMIN_GROUP: !Ref CognitoAdminGroup
+          COGNITO_STUDENT_GROUP: !Ref CognitoStudentGroup
+          # All handed to anonymous callers by GET /init so the SPA needs no build-time
+          # config. None is a secret: public SPA client, public endpoint, and the group
+          # names only pick a landing page - authorization is decided server-side on
+          # every request, so a caller lying about its group buys nothing.
+          COGNITO_CLIENT_ID: !Ref CognitoUserPoolClient
+          COGNITO_HOSTED_UI_DOMAIN: !Sub '${CognitoUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
+      Code:
+        ZipFile: |
+          """Loader only. The real handler lives in S3, at CODE_S3_KEY inside
+          CODE_BUCKET, because it is ~1000 lines - far past the 4096-character
+          ceiling CloudFormation puts on an inline ZipFile. Copy the handler
+          source to that key before the first invoke;
+          after that, re-uploading it is a code deploy on its own - no stack
+          update, just a cold start (or a config touch to force one).
+          """
+          import importlib.util
+          import os
+          import sys
+          import tempfile
+
+          import boto3
+
+          BUCKET      = os.environ["CODE_BUCKET"]
+          SCRIPT_KEY  = os.environ["CODE_S3_KEY"]
+          MODULE_NAME = "admin_backend"
+
+          _module = None
+
+
+          def _load():
+              body = boto3.client("s3").get_object(
+                  Bucket=BUCKET, Key=SCRIPT_KEY,
+              )["Body"].read().decode("utf-8")
+
+              # /tmp is the only writable path in the sandbox.
+              with tempfile.NamedTemporaryFile(
+                  mode="w", suffix=".py", dir="/tmp", delete=False,
+              ) as f:
+                  f.write(body)
+                  path = f.name
+              try:
+                  spec = importlib.util.spec_from_file_location(MODULE_NAME, path)
+                  module = importlib.util.module_from_spec(spec)
+                  sys.modules[MODULE_NAME] = module
+                  spec.loader.exec_module(module)
+                  return module
+              finally:
+                  os.unlink(path)
+
+
+          def lambda_handler(event, context):
+              """Cached in a module global, so only a cold start pays the S3 read
+              and the import - a warm container goes straight to handler()."""
+              global _module
+              if _module is None:
+                  _module = _load()
+              return _module.handler(event, context)
+
+  # 10. CONSOLE - HTTP API. The JWT authorizer proves the caller signed in; group
+  # membership is a separate check inside the handler, because a valid token says
+  # nothing about which group the caller is in. Every route below is admin-only
+  # except the three student routes, called out where they are declared.
+
+  AdminHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: gpu-guardian-admin-api
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - !Sub 'https://${FrontendDistribution.DomainName}'
+          - http://localhost:5173
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+
+  AdminHttpApiAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref AdminHttpApi
+      Name: CognitoJwtAuth
+      AuthorizerType: JWT
+      IdentitySource:
+        - $request.header.Authorization
+      JwtConfiguration:
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}'
+        Audience:
+          - !Ref CognitoUserPoolClient
+
+  AdminHttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref AdminHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AdminBackendFunction.Arn
+      # 2.0 is what puts event["routeKey"] in the payload. Do not drop to 1.0.
+      PayloadFormatVersion: '2.0'
+
+  # One route per RouteKey _dispatch_http knows about; a route with no branch there
+  # returns 404 from the handler rather than the API.
+
+  # The ONE unauthenticated route - AuthorizationType NONE is deliberate, because the
+  # SPA calls it to render the login screen itself. It therefore returns branding and
+  # public sign-in coordinates ONLY: if a field would interest someone who cannot log
+  # in, it does not belong here.
+  InitRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AdminHttpApi
+      RouteKey: 'GET /init'
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${AdminHttpApiIntegration}'
+
+  # Authenticated but gated to neither audience: its job is to tell the SPA which
+  # landing page to pick. Everything it returns is derived server-side from the token's
+  # group claim, and every admin route re-checks that claim independently.
+  WhoamiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AdminHttpApi
+      RouteKey: 'GET /whoami'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref AdminHttpApiAuthorizer
+      Target: !Sub 'integrations/${AdminHttpApiIntegration}'
+
+  GetPlatformInfoRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AdminHttpApi
+      RouteKey: 'GET /platform-info'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref AdminHttpApiAuthorizer
+      Target: !Sub 'integrations/${AdminHttpApiIntegration}'
+
+  ListStudentsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AdminHttpApi
+      RouteKey: 'GET /students'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref AdminHttpApiAuthorizer
+      Target: !Sub 'integrations/${AdminHttpApiIntegration}'
+
+  GetStudentRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AdminHttpApi
+      RouteKey: 'GET /students/{studentId}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref AdminHttpApiAuthorizer
+      Target: !Sub 'integrations/${AdminHttpApiIntegration}'
+
+  AddStudentRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AdminHttpApi
+      RouteKey: 'POST /students'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref AdminHttpApiAuthorizer
+      Target: !Sub 'integrations/${AdminHttpApiIntegration}'
+
+  DeleteStudentRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AdminHttpApi
+      RouteKey: 'DELETE /students/{studentId}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref AdminHttpApiAuthorizer
+      Target: !Sub 'integrations/${AdminHttpApiIntegration}'
+
+  UpdateBudgetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AdminHttpApi
+      RouteKey: 'PUT /students/{studentId}/budget'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref AdminHttpApiAuthorizer
+      Target: !Sub 'integrations/${AdminHttpApiIntegration}'
+
+  SuspendStudentRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AdminHttpApi
+      RouteKey: 'POST /students/{studentId}/suspend'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref AdminHttpApiAuthorizer
+      Target: !Sub 'integrations/${AdminHttpApiIntegration}'
+
+  ResumeStudentRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AdminHttpApi
+      RouteKey: 'POST /students/{studentId}/resume'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref AdminHttpApiAuthorizer
+      Target: !Sub 'integrations/${AdminHttpApiIntegration}'
+
+  ListAlarmEventsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AdminHttpApi
+      RouteKey: 'GET /alarm-events'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref AdminHttpApiAuthorizer
+      Target: !Sub 'integrations/${AdminHttpApiIntegration}'
+
+  # The three routes a STUDENT may call - the only ones not behind the admin-group
+  # check. All three resolve the caller from their email claim rather than the request,
+  # which is why none of these route keys has a path variable to tamper with.
+
+  # The student's own record, allowlisted to status, budget and spend. Answers even
+  # while suspended - that page is how they learn they are suspended, and why.
+  GetMyStudentRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AdminHttpApi
+      RouteKey: 'GET /me'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref AdminHttpApiAuthorizer
+      Target: !Sub 'integrations/${AdminHttpApiIntegration}'
+
+  # The student-facing metrics page, read straight from the usage ledger so a student
+  # sees the same number the enforcement decision is made on. capCovers and ratesAsOf
+  # pre-empt the obvious dispute: notebook compute only, priced from a dated rate
+  # table, excluding Space storage.
+  GetMyUsageRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AdminHttpApi
+      RouteKey: 'GET /me/usage'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref AdminHttpApiAuthorizer
+      Target: !Sub 'integrations/${AdminHttpApiIntegration}'
+
+  # A presigned URL for the caller's own UserProfile, refused while suspended.
+  GetMyStudioUrlRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AdminHttpApi
+      RouteKey: 'GET /me/studio-url'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref AdminHttpApiAuthorizer
+      Target: !Sub 'integrations/${AdminHttpApiIntegration}'
+
+  # Who called this API, when, as whom, and what came back. Separate from
+  # AdminBackendLogGroup on purpose: this one stays legible without the handler's
+  # operational noise, and it is the only record of requests the backend never saw -
+  # those rejected at the JWT authorizer.
+  AdminHttpApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "CloudWatch Logs has no AWS-managed-key option - see TRIAGE block"
+      checkov:
+        skip:
+          - id: "CKV_AWS_158"
+            comment: "Encrypted with the CloudWatch Logs service key; a CMK is not justified - see TRIAGE block"
+    Properties:
+      LogGroupName: /gpu-guardian/api-access
+      # Longer than the backend's 90 days: "who suspended this student" is a question
+      # that can surface a trimester later.
+      RetentionInDays: 365
+
+  AdminHttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    # No DependsOn needed: the Sub below is itself a Ref, which carries the ordering.
+    Properties:
+      ApiId: !Ref AdminHttpApi
+      # $default keeps ApiUrl free of a stage-name path segment.
+      StageName: $default
+      AutoDeploy: true
+      AccessLogSettings:
+        # Sub, NOT !GetAtt: GetAtt on a log group returns a trailing ':*' wildcard,
+        # which is an IAM Resource shape rather than a destination identifier.
+        DestinationArn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AdminHttpApiAccessLogGroup}'
+        # JSON, not clf, so Logs Insights needs no regex. jwtSub identifies the
+        # principal even on requests the integration rejects, and
+        # integrationErrorMessage is what distinguishes a loader-Lambda 500 from any
+        # other 500.
+        #
+        # jwtSub only, deliberately: the email claim was logged here until 2026-09-03,
+        # which wrote a real address into every request record and made a 365-day
+        # operational log a PII store. sub is the Cognito user id - stable, unique, and
+        # resolvable to a person on demand via admin-get-user or the students table -
+        # so it answers "who called this" without the log itself holding the identity.
+        Format: >-
+          {"requestId":"$context.requestId",
+          "requestTime":"$context.requestTime",
+          "httpMethod":"$context.httpMethod",
+          "path":"$context.path",
+          "routeKey":"$context.routeKey",
+          "status":"$context.status",
+          "protocol":"$context.protocol",
+          "responseLength":"$context.responseLength",
+          "integrationStatus":"$context.integrationStatus",
+          "integrationErrorMessage":"$context.integrationErrorMessage",
+          "sourceIp":"$context.identity.sourceIp",
+          "userAgent":"$context.identity.userAgent",
+          "jwtSub":"$context.authorizer.claims.sub"}
+
+  AdminHttpApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AdminBackendFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AdminHttpApi}/*'
+
+  # 11. CONSOLE - scheduled jobs. The same Lambda, invoked with a job name instead
+  # of a routeKey; what each one does is in docs/ARCHITECTURE.md section 11.
+  #
+  # usage_sync is the ONLY thing enforcing the cap. Disable this rule and students
+  # are uncapped with nothing else noticing - the honest cost of replacing AWS
+  # Budgets, whose action ran whether or not our code worked.
+
+  StackStatusSyncRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: gpu-guardian-admin-stack-status-sync
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Targets:
+        - Id: AdminBackendFunction
+          Arn: !GetAtt AdminBackendFunction.Arn
+          Input: '{"job": "stack_status_sync"}'
+
+  StackStatusSyncInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AdminBackendFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StackStatusSyncRule.Arn
+
+  UsageSyncRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: gpu-guardian-admin-usage-sync
+      # The sweep IS the meter, so this interval is the cap's precision. Built with
+      # Sub so it and SWEEP_MINUTES on the function cannot drift apart; MinValue is 2
+      # because this expression always writes the plural "minutes".
+      ScheduleExpression: !Sub 'rate(${SweepMinutes} minutes)'
+      State: ENABLED
+      Targets:
+        - Id: AdminBackendFunction
+          Arn: !GetAtt AdminBackendFunction.Arn
+          Input: '{"job": "usage_sync"}'
+
+  UsageSyncInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AdminBackendFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt UsageSyncRule.Arn
+
+  # Spend needs no rollover job; the DENY POLICY does. IAM has no concept of a
+  # billing period, so a student suspended on the 28th stays blocked on the 1st.
+  # This job detaches those policies - only where onHoldKind is BUDGET, so a manual
+  # suspension or a directory hold is not undone by a calendar page turning.
+  #
+  # Hourly rather than midnight on the 1st: idempotent and cheap, so one failed
+  # invocation delays a release by an hour instead of by a month.
+  PeriodRolloverRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: gpu-guardian-admin-period-rollover
+      ScheduleExpression: rate(1 hour)
+      State: ENABLED
+      Targets:
+        - Id: AdminBackendFunction
+          Arn: !GetAtt AdminBackendFunction.Arn
+          Input: '{"job": "period_rollover"}'
+
+  PeriodRolloverInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AdminBackendFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PeriodRolloverRule.Arn
+
+  # 12. CONSOLE - frontend hosting. Private S3 origin, CloudFront via OAC, SPA routing
+  # via custom error responses.
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    # Same as TemplatesBucket: emptied by a cleanup custom resource on delete.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub 'gpu-guardian-admin-frontend-${AWS::AccountId}'
+      # Already the effective default since January 2023; stated so the scanners see it.
+      # AES256 rather than the CMK: CloudFront reads this origin through OAC, and a
+      # CMK would mean granting the distribution kms:Decrypt for no gain.
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # Makes a bad SPA deploy a rollback rather than a rebuild, at the cost of the
+      # cleanup having to delete versions rather than keys.
+      VersioningConfiguration:
+        Status: Enabled
+      # Origin-side reads only - what CloudFront fetched on a cache miss. What the
+      # browser asked for is in the distribution's own log, under cloudfront/.
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LogsBucket
+        LogFilePrefix: s3-access-logs/frontend/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FrontendOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: gpu-guardian-admin-frontend-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # Scope: CLOUDFRONT means us-east-1 only - see the InUsEast1 condition. DefaultAction
+  # is Allow: this is a filter in front of a public SPA, not the authorization boundary.
+  # That boundary is still the JWT authorizer on AdminHttpApi, which the WAF does not
+  # sit in front of, so nothing here is load-bearing for access control.
+  FrontendWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Condition: InUsEast1
+    Properties:
+      Name: gpu-guardian-admin-frontend
+      Scope: CLOUDFRONT
+      Description: Managed rule groups and a per-IP rate limit in front of the admin console CDN.
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: gpu-guardian-admin-frontend
+      Rules:
+        # Count-mode overrides are deliberately absent. The origin serves a static SPA
+        # bundle over GET, so none of the request shapes these groups block are ones a
+        # legitimate console user produces. If you later put an API behind this
+        # distribution, expect SizeRestrictions_BODY to start blocking real traffic.
+        - Name: AmazonIpReputationList
+          Priority: 0
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AmazonIpReputationList
+        - Name: CommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CommonRuleSet
+        - Name: KnownBadInputsRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: KnownBadInputsRuleSet
+        # 2,000 requests per IP per five minutes. A cold console load is a few dozen
+        # requests and everything after it is cached, so this is orders of magnitude
+        # above a real user and still bounds what a single address can cost in
+        # CloudFront requests. A whole campus behind one NAT address is the case that
+        # would trip it - raise the limit rather than removing the rule.
+        - Name: PerIpRateLimit
+          Priority: 3
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 2000
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: PerIpRateLimit
+
+  # WAF insists the destination log group name begins with aws-waf-logs- and will not
+  # accept one that does not, whatever the ARN says.
+  FrontendWebAclLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: InUsEast1
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "CloudWatch Logs has no AWS-managed-key option - see TRIAGE block"
+      checkov:
+        skip:
+          - id: "CKV_AWS_158"
+            comment: "Encrypted with the CloudWatch Logs service key; a CMK is not justified - see TRIAGE block"
+    Properties:
+      LogGroupName: aws-waf-logs-gpu-guardian-admin-frontend
+      RetentionInDays: 30
+
+  # LogDestinationConfigs must carry the log-group ARN WITHOUT the trailing ':*' that
+  # !GetAtt ...Arn appends, so it is built with !Sub. WAF rejects the :* form.
+  FrontendWebAclLogging:
+    Type: AWS::WAFv2::LoggingConfiguration
+    Condition: InUsEast1
+    Properties:
+      ResourceArn: !GetAtt FrontendWebAcl.Arn
+      LogDestinationConfigs:
+        - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${FrontendWebAclLogGroup}'
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W70
+            reason: "MinimumProtocolVersion has no effect while using the default *.cloudfront.net certificate: when CloudFrontDefaultCertificate is true, CloudFront automatically sets the security policy to TLSv1 regardless of what the property asks for. This is a TRUE POSITIVE that is accepted, not a false one - the distribution really does negotiate TLS 1.0. Setting the property anyway would silence both scanners and change nothing at runtime, which is worse than the finding. Fixing it requires a custom domain plus an ACM certificate, which this platform does not have. See the note below."
+      checkov:
+        skip:
+          - id: "CKV_AWS_174"
+            comment: "Same root cause as W70 - with the default CloudFront certificate the security policy is fixed at TLSv1 and MinimumProtocolVersion cannot raise it. Accepted as a true positive; requires a custom domain + ACM to resolve. Do not 'fix' it by setting the property."
+    # ViewerCertificate is deliberately absent: with no custom domain, CloudFront
+    # forces the security policy to TLSv1 and no property raises the floor. The two
+    # TLS findings above are ACCEPTED TRUE POSITIVES, not false positives.
+    #
+    # DO NOT "fix" them by setting MinimumProtocolVersion - CloudFront overrides it
+    # back to TLSv1, silencing both scanners while changing nothing at runtime. The
+    # measurements, and why the exposure is limited to a public JS bundle:
+    # docs/SECURITY-FINDINGS.md section 15.
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        # WebACLId on a CLOUDFRONT-scope ACL takes the ARN, not the id, whatever the
+        # property is called. Omitted entirely outside us-east-1, where the ACL cannot
+        # exist - see the InUsEast1 condition.
+        WebACLId: !If [InUsEast1, !GetAtt FrontendWebAcl.Arn, !Ref 'AWS::NoValue']
+        # Two easy mistakes here: Bucket takes the DOMAIN NAME, not the ARN or name;
+        # and this must stay standard (legacy) logging, because CKV_AWS_86 and W10 do
+        # not look outside DistributionConfig and v2 delivery would still fail both.
+        Logging:
+          Bucket: !GetAtt LogsBucket.DomainName
+          Prefix: cloudfront/
+          IncludeCookies: false
+        Origins:
+          - Id: FrontendBucketOrigin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt FrontendOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: FrontendBucketOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # AWS-managed CachingOptimized
+          Compress: true
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F16
+            reason: "Principal '*' appears only on the DenyNonTlsRequests statement, where denying every principal is the intent. The Allow statement below names cloudfront.amazonaws.com and is further scoped to this one distribution's ARN."
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOacRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}'
+          # Never fires in the serving path - OAC is already HTTPS. It is here for the
+          # SPA upload and anything reaching the bucket directly.
+          - Sid: DenyNonTlsRequests
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt FrontendBucket.Arn
+              - !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  # 13. Teardown - CloudFormation cannot empty a bucket, so all three get a cleanup
+  # custom resource. Each Refs its bucket, and reverse-dependency deletion is what
+  # makes the emptying run BEFORE the bucket delete.
+  #
+  # Deleting this stack takes the whole platform with it, including the Cognito user
+  # pool that IS the roster in ACCOUNT mode. Per-student stacks are NOT deleted;
+  # delete them from the console first or their UserProfiles block the domain
+  # delete. Full order: docs/DEPLOYMENT.md, Teardown.
+
+  BucketCleanupFunctionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name is deliberate - see the SECURITY-SCANNER TRIAGE block above Resources"
+    Properties:
+      RoleName: gpu-guardian-admin-bucket-cleanup-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EmptyOwnBuckets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Logging
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/gpu-guardian-admin-bucket-cleanup:*'
+              - Sid: ListVersions
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource:
+                  - !GetAtt TemplatesBucket.Arn
+                  - !GetAtt FrontendBucket.Arn
+                  - !GetAtt LogsBucket.Arn
+              - Sid: DeleteObjects
+                # Scoped to this stack's three buckets: a wildcard here would let
+                # teardown empty any bucket in the account.
+                Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                Resource:
+                  - !Sub '${TemplatesBucket.Arn}/*'
+                  - !Sub '${FrontendBucket.Arn}/*'
+                  - !Sub '${LogsBucket.Arn}/*'
+
+  BucketCleanupFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Only calls the public S3 API and the CloudFormation response URL - no VPC resources to reach"
+          - id: W92
+            reason: "No ReservedConcurrentExecutions: this is a CloudFormation custom resource that runs at most three times per stack lifetime, once per bucket, at teardown. Reserving concurrency would take capacity from the account's pool permanently to cap something that cannot loop."
+      checkov:
+        skip:
+          - id: "CKV_AWS_117"
+            comment: "Only calls the public S3 API - no VPC resources to reach"
+          - id: "CKV_AWS_115"
+            comment: "Runs at most three times per stack lifetime, at teardown - no throughput to limit"
+          - id: "CKV_AWS_116"
+            comment: "No DLQ: this is invoked synchronously by CloudFormation, not asynchronously, so there is no async retry path for a DLQ to catch. A failure is reported straight back to the stack operation and fails the delete - which is the correct and visible outcome. Contrast AdminBackendFunction, whose scheduled invocations ARE async and which does have a dead-letter target."
+    Properties:
+      FunctionName: gpu-guardian-admin-bucket-cleanup
+      # Explicit, same reason as AdminBackendFunction.
+      LoggingConfig:
+        LogGroup: !Ref BucketCleanupLogGroup
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Role: !GetAtt BucketCleanupFunctionRole.Arn
+      # Runs once per bucket at teardown, and a frontend bucket can hold a lot of
+      # versions.
+      Timeout: 900
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          """Empties one S3 bucket when the stack is deleted, so the bucket
+          delete that follows it doesn't fail on a non-empty bucket. Create and
+          Update are deliberate no-ops - this exists only for the delete path.
+          """
+          import json
+          import logging
+          import urllib.request
+
+          import boto3
+
+          # logging, not print: the Lambda runtime's handler already stamps each record
+          # with the request id and a level, so a failed teardown can be found by
+          # filtering on ERROR rather than by reading the whole stream.
+          log = logging.getLogger()
+          log.setLevel(logging.INFO)
+
+          s3 = boto3.client("s3")
+
+
+          def empty(bucket):
+              """Versioning is on, so live versions AND delete markers have to go -
+              deleting only keys leaves the bucket 'empty' but still undeletable."""
+              deleted = 0
+              for page in s3.get_paginator("list_object_versions").paginate(Bucket=bucket):
+                  batch = [{"Key": o["Key"], "VersionId": o["VersionId"]}
+                           for section in ("Versions", "DeleteMarkers")
+                           for o in page.get(section, [])]
+                  for i in range(0, len(batch), 1000):  # DeleteObjects caps at 1000
+                      chunk = batch[i:i + 1000]
+                      s3.delete_objects(Bucket=bucket,
+                                        Delete={"Objects": chunk, "Quiet": True})
+                      deleted += len(chunk)
+              return deleted
+
+
+          def respond(event, status, reason):
+              body = json.dumps({
+                  "Status"             : status,
+                  "Reason"             : reason[:1000],
+                  "PhysicalResourceId" : event.get("PhysicalResourceId") or event["LogicalResourceId"],
+                  "StackId"            : event["StackId"],
+                  "RequestId"          : event["RequestId"],
+                  "LogicalResourceId"  : event["LogicalResourceId"],
+                  "Data"               : {},
+              }).encode()
+              # Content-Type must be empty on the presigned PUT, or S3 rejects it.
+              urllib.request.urlopen(urllib.request.Request(
+                  event["ResponseURL"], data=body, method="PUT",
+                  headers={"Content-Type": "", "Content-Length": str(len(body))}))
+
+
+          def lambda_handler(event, context):
+              """Never raises. An unanswered custom resource wedges the stack for a
+              full hour, and on a Delete that means it cannot be torn down at all."""
+              request_type = event.get("RequestType")
+              try:
+                  bucket = event["ResourceProperties"]["Bucket"]
+                  reason = f"{request_type}: nothing to do"
+                  if request_type == "Delete":
+                      reason = f"Emptied {bucket}: {empty(bucket)} object versions deleted"
+                  log.info(reason)
+                  respond(event, "SUCCESS", reason)
+              except Exception as e:
+                  log.exception("bucket cleanup failed: %s", e)
+                  # SUCCESS on Delete even when emptying failed: FAILED only blocks the
+                  # teardown, and a still-occupied bucket fails loudly on its own delete.
+                  respond(event, "SUCCESS" if request_type == "Delete" else "FAILED", str(e))
+
+  # Retention policy for the same reason as AdminBackendLogGroup: Lambda created this
+  # group itself, so CloudFormation has to adopt it rather than create it.
+  BucketCleanupLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "CloudWatch Logs has no AWS-managed-key option - see TRIAGE block"
+      checkov:
+        skip:
+          - id: "CKV_AWS_158"
+            comment: "Encrypted with the CloudWatch Logs service key; contents are teardown progress messages - see TRIAGE block"
+    Properties:
+      LogGroupName: /aws/lambda/gpu-guardian-admin-bucket-cleanup
+      RetentionInDays: 30
+
+  # The two DependsOn: LogsBucketCleanup make the logs bucket empty LAST - emptying
+  # the other two generates requests it records, so clearing it first leaves objects
+  # behind and fails its own delete. Read the direction carefully: CloudFormation
+  # deletes a resource BEFORE what it depends on.
+  TemplatesBucketCleanup:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: LogsBucketCleanup
+    Properties:
+      ServiceToken: !GetAtt BucketCleanupFunction.Arn
+      Bucket: !Ref TemplatesBucket
+
+  FrontendBucketCleanup:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: LogsBucketCleanup
+    Properties:
+      ServiceToken: !GetAtt BucketCleanupFunction.Arn
+      Bucket: !Ref FrontendBucket
+
+  LogsBucketCleanup:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt BucketCleanupFunction.Arn
+      Bucket: !Ref LogsBucket
+
+  # 14. Does the enforcement still work? These alarms watch the ENFORCER, not the
+  # enforced: usage_sync is the cap, and if it stops running nothing suspends
+  # anybody and no human is told - the cap fails silent, not closed.
+  #
+  # All three treat missing data as BREACHING, deliberately. A function that stopped
+  # being invoked emits no Errors metric at all, so the notBreaching default would
+  # make "the sweep is dead" look identical to "the sweep is healthy".
+
+  BackendErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name is deliberate and, unlike the W28s in the TRIAGE block, carries no replacement risk: an alarm holds no state worth preserving, so replacing it costs nothing. The name is what the runbook cites and what an operator greps for at 2am, and a generated suffix would break both."
+    Properties:
+      AlarmName: gpu-guardian-admin-backend-errors
+      AlarmDescription: >-
+        The admin backend is failing. If the failures are in usage_sync, per-student
+        caps are not being enforced while this alarm is active - check the sweep logs
+        in /aws/lambda/gpu-guardian-admin-backend before assuming students are capped.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AdminBackendFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      # Threshold 0: there is no acceptable error rate for the thing that stops spend.
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref AdminAlertsTopic
+      OKActions:
+        - !Ref AdminAlertsTopic
+
+  BackendThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name is deliberate - stateless resource, no replacement risk, and the name is the runbook's handle on it. Same reasoning as BackendErrorsAlarm."
+    Properties:
+      AlarmName: gpu-guardian-admin-backend-throttles
+      AlarmDescription: >-
+        Invocations of the admin backend are being throttled against its
+        ReservedConcurrentExecutions of 10. A throttled scheduled invocation is a
+        sweep that never ran, so treat this the same as an error.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AdminBackendFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AdminAlertsTopic
+
+  BackendDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name is deliberate - stateless resource, no replacement risk, and the name is the runbook's handle on it. Same reasoning as BackendErrorsAlarm."
+    Properties:
+      AlarmName: gpu-guardian-admin-backend-duration
+      AlarmDescription: >-
+        The admin backend is running long enough to be at risk of hitting its 120s
+        timeout. This is the early warning for the scaling limit in COSTING.md
+        section 4.3: usage_sync walks students serially, so sweep duration grows
+        linearly with class size, and a sweep that times out is a sweep that did not
+        finish enforcing. Batch the per-student work before raising the timeout.
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AdminBackendFunction
+      # Maximum, not Average: an average over a window full of fast API requests hides
+      # the one slow sweep completely.
+      Statistic: Maximum
+      Period: 300
+      # 75% of the 120s timeout - headroom to act, not a post-mortem.
+      Threshold: 90000
+      EvaluationPeriods: 2
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AdminAlertsTopic
+
+Outputs:
+
+  # ---- platform ----
+  StudioDomainId:
+    Description: Studio domain every student UserProfile is created in. Already written to /gpu-guardian-admin/existing-domain-id, so the console needs no further wiring.
+    Value: !Ref StudioDomain
+  StudentGroupId:
+    Condition: IsOrgInstance
+    Description: IdC group the console adds each new student to. Already written to /gpu-guardian-admin/student-group-id. Absent in ACCOUNT mode - see CognitoStudentGroupName instead.
+    Value: !GetAtt StudentGroup.GroupId
+  StudentPermissionSetArn:
+    Condition: IsOrgInstance
+    Description: Absent in ACCOUNT mode - account instances don't support permission sets.
+    Value: !GetAtt StudentPermissionSet.PermissionSetArn
+  IdentityMode:
+    Description: Echoed back so a deployed stack states its own mode. Also the value of the backend's IDENTITY_MODE.
+    Value: !Ref IdentityCenterInstanceType
+  StudioDomainAuthMode:
+    Description: AuthMode the domain was created with. Immutable - changing it replaces the domain and every UserProfile in it.
+    Value: !If [IsOrgInstance, SSO, IAM]
+  VpcId:
+    Value: !Ref Vpc
+  PublicSubnetId:
+    Value: !Ref PublicSubnet
+  DomainExecutionRoleArn:
+    Value: !GetAtt DomainExecutionRole.Arn
+
+  # ---- console ----
+  ApiUrl:
+    Description: Base URL of the admin HTTP API
+    Value: !Sub 'https://${AdminHttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  FrontendUrl:
+    Value: !Sub 'https://${FrontendDistribution.DomainName}'
+  StudentsTableName:
+    Value: !Ref StudentsTable
+  UsageLedgerTableName:
+    Description: >-
+      Metering ledger the cap is enforced from. Query
+      studentId = <id> AND begins_with(sk, 'PERIOD#') to read a student's spend
+      exactly as the enforcement job sees it.
+    Value: !Ref UsageLedgerTable
+  ConsumptionLogGroupName:
+    Description: >-
+      Structured audit of every metering and enforcement decision. Query it in
+      Logs Insights to reconstruct how a student reached their cap - this is the
+      record to reach for when a charge is disputed.
+    Value: !Ref ConsumptionLogGroup
+  EnforcementLagMinutes:
+    Description: >-
+      Metering interval actually deployed, and therefore the cap's precision:
+      worst-case overshoot is this many minutes of the student's hourly rate.
+      Reported to students verbatim by GET /me.
+    Value: !Ref SweepMinutes
+  ClassPoolCapUsd:
+    Description: Monthly class-wide notify-only threshold in force. 0 means the check is disabled.
+    Value: !Ref ClassPoolCapUsd
+  AdminBackendFunctionArn:
+    Value: !GetAtt AdminBackendFunction.Arn
+  TemplatesBucketName:
+    Description: Upload the backend handler (BackendScriptS3Key) and the per-student template (StudentTemplateS3Key) here before adding the first student.
+    Value: !Ref TemplatesBucket
+  StudentTemplateS3Url:
+    Description: Exactly what /gpu-guardian-admin/template-s3-url was set to - the object at this URL must exist before the console can provision a student.
+    Value: !Sub 'https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/${StudentTemplateS3Key}'
+  StudentStackDeployRoleArn:
+    Value: !GetAtt StudentStackDeployRole.Arn
+  AdminAlertsTopicArn:
+    Value: !Ref AdminAlertsTopic
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  FrontendDistributionId:
+    Value: !Ref FrontendDistribution
+  # Empty outside us-east-1, where a CLOUDFRONT-scope WebACL cannot be created and the
+  # distribution therefore has no WAF in front of it. Check this after a deploy.
+  FrontendWebAclArn:
+    Value: !If [InUsEast1, !GetAtt FrontendWebAcl.Arn, '']
+  CognitoUserPoolId:
+    Value: !Ref CognitoUserPool
+  CognitoClientId:
+    Value: !Ref CognitoUserPoolClient
+  AdminGroupId:
+    Condition: IsOrgInstance
+    Description: IdC group the SAML application is assigned to. Absent in ACCOUNT mode - see CognitoAdminGroupName instead.
+    Value: !GetAtt AdminGroup.GroupId
+  CognitoAdminGroupName:
+    Description: Cognito group granting the admin routes. In ACCOUNT mode, add your ops users to this group after the deploy - nothing else grants console access.
+    Value: !Ref CognitoAdminGroup
+  CognitoStudentGroupName:
+    Description: Cognito group granting GET /me/studio-url. In ACCOUNT mode the backend adds each provisioned student to it automatically.
+    Value: !Ref CognitoStudentGroup
+  SignInUrl:
+    Description: Cognito hosted-UI sign-in page. The console's own login screen in ACCOUNT mode; in ORGANIZATION mode with SAML configured it redirects straight to the IdC login.
+    Value: !Sub 'https://gpu-guardian-admin-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${CognitoUserPoolClient}&response_type=code&scope=openid+email+profile&redirect_uri=https%3A%2F%2F${FrontendDistribution.DomainName}%2F'
+  SamlAcsUrl:
+    Condition: IsOrgInstance
+    Description: Paste this as the ACS URL when creating the IdC SAML 2.0 application. ORGANIZATION mode only - account instances don't support SAML applications.
+    Value: !Sub 'https://gpu-guardian-admin-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/saml2/idpresponse'
+  SamlAudience:
+    Condition: IsOrgInstance
+    Description: Paste this as the Audience URI / Application SAML audience when creating the IdC SAML 2.0 application. ORGANIZATION mode only.
+    Value: !Sub 'urn:amazon:cognito:sp:${CognitoUserPool}'

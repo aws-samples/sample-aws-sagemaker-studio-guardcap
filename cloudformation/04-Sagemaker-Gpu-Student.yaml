@@ -1,0 +1,843 @@
+# ONE student's footprint, as its own stack. Created per student by the admin
+# console against an existing platform stack; launch it by hand only to debug.
+# What it does and does not enforce: Description below. Resources:
+# docs/ARCHITECTURE.md. Parameters: docs/SETUP.md. Teardown, and why a notebook
+# that was ever opened blocks DeleteStack: docs/DEPLOYMENT.md.
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SageMaker GPU Guardian - ONE student's end-to-end slice: their Studio
+  execution role, their notebook UserProfile, the two enforcement resources
+  aimed at them, and a cleanup handler that lets the stack delete. Created once
+  per student by the admin console, against an existing platform stack.
+
+  Contains no AWS::Budgets::Budget. This stack provides the HANDS of cap
+  enforcement (DenyNewAppsPolicy, StopStudioAppFunction); the platform's backend
+  provides the TRIGGER, metering Studio runtime into a DynamoDB ledger every few
+  minutes and attaching the policy itself. Budget actions cost $0.10 per
+  action-enabled budget-day - 84% of this stack's standing cost - to evaluate a
+  cap on data refreshed about three times a day. See docs/COSTING.md 4.1-4.2.
+
+  So this stack CANNOT enforce its own cap standalone. It is capped
+  only while the platform's usage_sync job runs.
+
+  Per-student resource names are load-bearing: the console scopes its IAM to
+  exactly these names, so renaming anything breaks enforcement.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Platform to attach to
+        Parameters:
+          - ExistingDomainId
+          - DomainAuthMode
+      - Label:
+          default: Student
+        Parameters:
+          - StudentId
+          - InstanceType
+          - PerStudentBudgetUsd
+      - Label:
+          default: Notifications
+        Parameters:
+          - NotificationEmail
+    ParameterLabels:
+      StudentId:
+        default: Student identifier (must match their IAM Identity Center username, e.g. institutional email prefix)
+
+Parameters:
+  ExistingDomainId:
+    Type: String
+    Description: >-
+      Studio domain this student's UserProfile is created in, from the platform
+      stack's StudioDomainId output. This template never creates a domain.
+    AllowedPattern: '^d-[a-zA-Z0-9]+$'
+    ConstraintDescription: Must be a SageMaker Studio domain ID, e.g. d-abcd1234efgh.
+
+  DomainAuthMode:
+    Type: String
+    AllowedValues: [SSO, IAM]
+    Description: >-
+      AuthMode of the domain in ExistingDomainId, from the platform stack's
+      StudioDomainAuthMode output. It MUST match: a UserProfile may carry
+      SingleSignOnUser* only under SSO, and must not under IAM. The console passes
+      this through, so it is set by hand only for a standalone launch.
+
+  StudentId:
+    Type: String
+    Default: demo-student-01
+    Description: Unique student identifier, also the suffix of every resource name here and the cost-allocation tag value. Under SSO it must match their Identity Center username.
+    AllowedPattern: '^[a-zA-Z0-9._-]{3,63}$'
+
+  InstanceType:
+    Type: String
+    Default: ml.t3.medium
+    AllowedValues:
+      - ml.t3.medium      # cheap placeholder for rehearsal/demo
+      - ml.g4dn.xlarge     # production: 1x T4 16GB
+      - ml.g5.xlarge       # production: 1x A10G 24GB
+      - ml.g6.xlarge       # production: 1x L4 24GB, best price-performance
+    Description: Notebook instance type. This AllowedValues list IS the tier control - there is no other check on what a student may ask for.
+
+  PerStudentBudgetUsd:
+    Type: Number
+    Default: 80
+    MinValue: 1
+    Description: >-
+      Per-student monthly cap in USD, recorded at provisioning time. Reference only
+      - the enforced figure lives in the students table so it can be raised without
+      a stack update, which means this will read stale once it has been. Covers
+      notebook compute only, not the Space's EBS volume.
+
+  NotificationEmail:
+    Type: String
+    Description: >-
+      Ops address recorded on the student's record for the console to show. This
+      stack creates no SNS resources - notices go to the platform's one
+      consolidated topic, because a per-student topic would need its own
+      confirmation click and an unconfirmed one is a silent alert channel.
+
+  StorageKmsKeyArn:
+    Type: String
+    Default: ''
+    Description: >-
+      ARN of the platform CMK encrypting the domain's Space volumes, which the
+      backend reads from /gpu-guardian-admin/storage-kms-key-arn. EMPTY MEANS NO
+      NOTEBOOK WILL START: the grant is conditional, so the stack still reaches
+      CREATE_COMPLETE and the failure appears only when the student opens a Space.
+      Must be the ARN; an alias does not match.
+    AllowedPattern: '^$|^arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/.+$'
+    ConstraintDescription: Must be empty or a KMS key ARN.
+
+Conditions:
+  IsSsoDomain: !Equals [!Ref DomainAuthMode, 'SSO']
+  HasStorageKmsKey: !Not [!Equals [!Ref StorageKmsKeyArn, '']]
+
+# SCANNER TRIAGE - read before "fixing" a suppression. Every finding and its
+# disposition: docs/SECURITY-FINDINGS.md; each suppression also has an inline reason.
+# The one that matters: DenyNewAppsPolicy's Resource '*' (W12/W11) is a DENY and the
+# wildcard IS the security property - it must cover every app and space ARN a breached
+# student could reach for, including shapes that do not exist yet. Narrowing it
+# reopens the cap.
+
+Resources:
+
+  # One execution role per student, so attaching the deny policy at the cap
+  # targets exactly one student without touching anyone else's access.
+
+  StudentExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "The name IS the enforcement handle - AdminBackendFunctionRole matches arn:aws:iam::*:role/gpu-guardian-*-exec-role. See TRIAGE block."
+    Properties:
+      RoleName: !Sub 'gpu-guardian-${StudentId}-exec-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: StudentId
+          Value: !Ref StudentId
+        # For cost allocation, not enforcement: it is what makes this student's
+        # spend findable in Cost Explorer. Nothing reads it to decide anything.
+        - Key: CostCenter
+          Value: SageMaker-GPU-Guardian
+
+  StudentExecutionRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: MinimalStudioLogging
+      Roles:
+        - !Ref StudentExecutionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sagemaker/*'
+          # This statement is what decides whether the student can open a notebook
+          # at all: their Space's EBS volume is encrypted with the platform key.
+          # Nothing here fails at deploy time - an empty StorageKmsKeyArn drops the
+          # whole block and the stack still reaches CREATE_COMPLETE.
+          #
+          # Do NOT add conditions. Both kms:GrantIsForAWSResource and kms:ViaService
+          # were tried and each DENIES Space creation. Mirror of this block is on
+          # DomainExecutionRolePolicy in the platform template; change one, check
+          # the other. Full diagnosis: docs/DEPLOYMENT.md, "Notebooks will not start".
+          - !If
+            - HasStorageKmsKey
+            - Sid: UseStorageEncryptionKey
+              Effect: Allow
+              Action:
+                - kms:CreateGrant
+                - kms:Decrypt
+                - kms:DescribeKey
+                - kms:GenerateDataKey
+                - kms:GenerateDataKeyWithoutPlaintext
+              Resource: !Ref StorageKmsKeyArn
+            - !Ref AWS::NoValue
+
+  # The browser session runs AS this role under both identity modes, so it needs
+  # baseline Studio UI permissions and not just logging. The entry path differs
+  # between SSO and IAM; the session identity does not.
+  StudentExecutionRoleStudioAccessPolicy:
+    Type: AWS::IAM::Policy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W12
+            reason: "The only wildcard statement is SMStudioAppPermissionsListAndDescribe - read-only List*/Describe* actions that support no resource-level ARNs. Copied from AWS's own published Studio execution-role policy. See TRIAGE block."
+          - id: W76
+            reason: "SPCM 25+ reflects five narrowly-conditioned Sids mirroring AWS's published Studio policy, several carrying Null conditions on sagemaker:OwnerUserProfileArn. Merging them to lower the metric would drop those conditions."
+    Properties:
+      PolicyName: StudioAppAccess
+      Roles:
+        - !Ref StudentExecutionRole
+      # Mirrors AWS's published Studio execution-role policy rather than a
+      # hand-scoped subset, because Studio's UI probes more than this domain uses.
+      # ${!sagemaker:...} is escaped deliberately: those are IAM policy variables
+      # resolved per-request, so Fn::Sub must leave them alone.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: SMStudioUserProfileAppPermissionsCreateAndDelete
+            Effect: Allow
+            Action:
+              - sagemaker:CreateApp
+              - sagemaker:DeleteApp
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:app/*'
+            Condition:
+              'Null':
+                sagemaker:OwnerUserProfileArn: 'true'
+          - Sid: SMStudioCreatePresignedDomainUrlForUserProfile
+            Effect: Allow
+            Action:
+              - sagemaker:CreatePresignedDomainUrl
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:user-profile/${!sagemaker:DomainId}/${!sagemaker:UserProfileName}'
+          - Sid: SMStudioAppPermissionsListAndDescribe
+            Effect: Allow
+            Action:
+              - sagemaker:ListApps
+              - sagemaker:ListDomains
+              - sagemaker:ListUserProfiles
+              - sagemaker:ListSpaces
+              - sagemaker:DescribeApp
+              - sagemaker:DescribeDomain
+              - sagemaker:DescribeUserProfile
+              - sagemaker:DescribeSpace
+            Resource: '*'
+          - Sid: SMStudioAppPermissionsTagOnCreate
+            Effect: Allow
+            Action:
+              - sagemaker:AddTags
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:*/*'
+            Condition:
+              'Null':
+                sagemaker:TaggingAction: 'false'
+          - Sid: SMStudioRestrictSharedSpacesWithoutOwners
+            Effect: Allow
+            Action:
+              - sagemaker:CreateSpace
+              - sagemaker:UpdateSpace
+              - sagemaker:DeleteSpace
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:space/${!sagemaker:DomainId}/*'
+            Condition:
+              'Null':
+                sagemaker:OwnerUserProfileArn: 'true'
+          - Sid: SMStudioRestrictSpacesToOwnerUserProfile
+            Effect: Allow
+            Action:
+              - sagemaker:CreateSpace
+              - sagemaker:UpdateSpace
+              - sagemaker:DeleteSpace
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:space/${!sagemaker:DomainId}/*'
+            Condition:
+              ArnLike:
+                sagemaker:OwnerUserProfileArn: !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:user-profile/${!sagemaker:DomainId}/${!sagemaker:UserProfileName}'
+              StringEquals:
+                sagemaker:SpaceSharingType:
+                  - Private
+                  - Shared
+          - Sid: SMStudioRestrictCreatePrivateSpaceAppsToOwnerUserProfile
+            Effect: Allow
+            Action:
+              - sagemaker:CreateApp
+              - sagemaker:DeleteApp
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:app/${!sagemaker:DomainId}/*'
+            Condition:
+              ArnLike:
+                sagemaker:OwnerUserProfileArn: !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:user-profile/${!sagemaker:DomainId}/${!sagemaker:UserProfileName}'
+              StringEquals:
+                sagemaker:SpaceSharingType:
+                  - Private
+          - Sid: AllowAppActionsForSharedSpaces
+            Effect: Allow
+            Action:
+              - sagemaker:CreateApp
+              - sagemaker:DeleteApp
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:app/${!sagemaker:DomainId}/*/*/*'
+            Condition:
+              StringEquals:
+                sagemaker:SpaceSharingType:
+                  - Shared
+
+  # The student's notebook identity inside the existing Studio domain.
+
+  StudentUserProfile:
+    Type: AWS::SageMaker::UserProfile
+    Properties:
+      DomainId: !Ref ExistingDomainId
+      UserProfileName: !Sub 'student-${StudentId}'
+      # SSO domains only: CreateUserProfile requires these under SSO and rejects
+      # them under IAM. AWS::NoValue drops the properties rather than sending an
+      # empty string, which fails the same way. StudentId doubles as the IdC
+      # username, hence the parameter description insisting the two match.
+      SingleSignOnUserIdentifier: !If [IsSsoDomain, UserName, !Ref 'AWS::NoValue']
+      SingleSignOnUserValue: !If [IsSsoDomain, !Ref StudentId, !Ref 'AWS::NoValue']
+      UserSettings:
+        ExecutionRole: !GetAtt StudentExecutionRole.Arn
+        KernelGatewayAppSettings:
+          DefaultResourceSpec:
+            InstanceType: !Ref InstanceType
+      Tags:
+        - Key: StudentId
+          Value: !Ref StudentId
+        - Key: CostCenter
+          Value: SageMaker-GPU-Guardian
+
+  # Cap enforcement layer 1, blocks FUTURE spend. Created here, attached from
+  # elsewhere: the admin backend attaches it at the cap and detaches on resume.
+  # Nothing in THIS stack attaches it, so this template alone is inert.
+
+  DenyNewAppsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "The name IS the enforcement handle - AdminBackendFunctionRole's SuspendResume statement is conditioned on iam:PolicyARN ArnLike arn:aws:iam::*:policy/gpu-guardian-*-deny-new-apps. See TRIAGE block."
+          - id: W12
+            reason: "MUST NOT BE NARROWED. This is a Deny statement and the wildcard is the security property: it has to cover every app and space ARN the student could reach for, including shapes that do not exist yet. Scoping it to named resources reopens the cap. See TRIAGE block."
+    Properties:
+      ManagedPolicyName: !Sub 'gpu-guardian-${StudentId}-deny-new-apps'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNewComputeAtCap
+            Effect: Deny
+            Action:
+              - sagemaker:CreateApp
+              # CreateSpace and UpdateSpace as well: a Space is how current Studio starts
+              # a notebook, so denying CreateApp alone left a breached student able to
+              # launch again, and UpdateSpace can grow the billable EBS volume. Delete*
+              # is deliberately absent - a suspended student, and teardown, must still
+              # be able to tidy up.
+              - sagemaker:CreateSpace
+              - sagemaker:UpdateSpace
+            Resource: '*'
+
+  # Cap enforcement layer 2, stops ALREADY-RUNNING compute. Invoked by the admin
+  # backend right after layer 1: denying CreateApp does nothing about a kernel
+  # already burning $1.41/hour.
+
+  StopStudioAppFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "FALSE POSITIVE - logs grant is in StopStudioAppFunctionRolePolicy, a separate AWS::IAM::Policy that cfn_nag cannot follow. See TRIAGE block."
+          - id: W89
+            reason: "Calls only the public SageMaker and Logs APIs - nothing in the platform VPC to reach"
+          - id: W92
+            reason: "No ReservedConcurrentExecutions: this is the kill switch. Reserving concurrency per student would consume the account's concurrency pool linearly with class size, and throttling THIS function means a breached student's notebook keeps billing. Deliberately left unreserved so it can always run."
+      checkov:
+        skip:
+          - id: "CKV_AWS_117"
+            comment: "Calls only public AWS APIs - no VPC resources to reach"
+          - id: "CKV_AWS_115"
+            comment: "Deliberately unreserved - throttling the kill switch means an un-stopped notebook. See the W92 reason."
+          - id: "CKV_AWS_116"
+            comment: "No DLQ: the caller is _enforce_breach in the admin backend, which checks the invoke result and refuses to record ON_HOLD unless enforcement succeeded - it alerts instead. That is a stronger guarantee than a dead-letter queue, because a queued failure would still leave a record claiming the student was suspended."
+          - id: "CKV_AWS_173"
+            comment: "Environment variables hold a domain id and a student id - no secrets. See TRIAGE block."
+    Properties:
+      FunctionName: !Sub 'gpu-guardian-${StudentId}-stop-app'
+      # Names the log group explicitly rather than leaning on Lambda's implicit
+      # /aws/lambda/<FunctionName>. Both resolve to the same group here, but declaring
+      # it makes the association reviewable in the template instead of inferable from a
+      # naming convention, and it stops a rename silently orphaning the retention policy.
+      #
+      # This Ref also carries the DELETE ordering that used to be an explicit DependsOn:
+      # CloudFormation deletes in reverse dependency order, so the function goes before
+      # its group. Without that ordering the group is deleted while the function still
+      # exists, Lambda re-creates it un-retained, and the student can never be re-added.
+      # See docs/DEPLOYMENT.md, "A deleted student cannot be re-added". Do not drop it.
+      LoggingConfig:
+        LogGroup: !Ref StopStudioAppLogGroup
+      Runtime: python3.12
+      Handler: index.handler
+      # 60s, not 30: the listing below pages the whole domain, because the
+      # per-profile filter cannot see the apps this has to stop.
+      Timeout: 60
+      Role: !GetAtt StopStudioAppFunctionRole.Arn
+      Environment:
+        Variables:
+          DOMAIN_ID: !Ref ExistingDomainId
+          USER_PROFILE_NAME: !Sub 'student-${StudentId}'
+      Code:
+        ZipFile: |
+          import logging, os
+
+          import boto3
+
+          # logging, not print: the runtime stamps each record with the request id and a
+          # level, so "did the cap actually delete anything" is answerable by filtering
+          # the group rather than by reading every invocation.
+          log = logging.getLogger()
+          log.setLevel(logging.INFO)
+
+          sm = boto3.client("sagemaker")
+
+          DOMAIN_ID    = os.environ["DOMAIN_ID"]
+          USER_PROFILE = os.environ["USER_PROFILE_NAME"]
+          LIVE         = ("InService", "Pending")
+
+
+          def paginate(method, key, **kwargs):
+              token = None
+              while True:
+                  page = method(**kwargs, **({"NextToken": token} if token else {}))
+                  yield from page[key]
+                  token = page.get("NextToken")
+                  if not token:
+                      return
+
+
+          def owned_spaces():
+              """Names of the Spaces this student's UserProfile owns.
+
+              Opening JupyterLab in the current Studio experience silently creates a private
+              Space (quickstart-default-xxxxxx) and runs the notebook inside it, so the Space
+              is where the spend lives. ListSpaces has no owner filter, hence the client-side
+              match on OwnershipSettingsSummary.
+              """
+              return {s["SpaceName"]
+                      for s in paginate(sm.list_spaces, "Spaces", DomainIdEquals=DOMAIN_ID)
+                      if (s.get("OwnershipSettingsSummary") or {}).get("OwnerUserProfileName") == USER_PROFILE}
+
+
+          def live_apps(spaces):
+              """This student's running apps, whether they hang off the profile or off one of its Spaces.
+
+              Deliberately NOT list_apps(UserProfileNameEquals=...), which is what this used to
+              do: an app inside a Space reports UserProfileName as null and is not returned by
+              that filter at all. So the old query answered {"Apps": []} while an ml.t3.medium
+              JupyterLab billed for three days, and this function - the half of the cap that is
+              supposed to stop compute already running - was a no-op. Listing the domain and
+              matching on either key is the only way to see both kinds of app.
+              """
+              return [a for a in paginate(sm.list_apps, "Apps", DomainIdEquals=DOMAIN_ID)
+                      if (a.get("UserProfileName") == USER_PROFILE or a.get("SpaceName") in spaces)
+                      and a.get("Status") in LIVE]
+
+
+          def handler(event, context):
+              stopped = []
+              for app in live_apps(owned_spaces()):
+                  # DeleteApp takes SpaceName XOR UserProfileName, matching how the app was
+                  # created - passing the profile for a space-based app is rejected.
+                  owner = ({"SpaceName": app["SpaceName"]} if app.get("SpaceName")
+                           else {"UserProfileName": USER_PROFILE})
+                  sm.delete_app(DomainId=DOMAIN_ID, AppType=app["AppType"],
+                                AppName=app["AppName"], **owner)
+                  stopped.append(f'{owner.get("SpaceName") or USER_PROFILE}/{app["AppName"]}')
+              log.info("stopped apps for %s: %s", USER_PROFILE, stopped)
+              return {"stopped": stopped}
+
+  StopStudioAppFunctionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit per-student name, consistent with the rest of this stack - see TRIAGE block"
+    Properties:
+      RoleName: !Sub 'gpu-guardian-${StudentId}-stop-app-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+  StopStudioAppFunctionRolePolicy:
+    Type: AWS::IAM::Policy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W12
+            reason: "Only FindThisStudentsSpacesAndApps uses '*', for read-only ListApps/ListSpaces which support no resource ARNs. The two DeleteApp statements beside it are scoped by profile ARN and by OwnerUserProfileArn. See TRIAGE block."
+    Properties:
+      PolicyName: StopOneStudentsApps
+      Roles:
+        - !Ref StopStudioAppFunctionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: FindThisStudentsSpacesAndApps
+            # Neither action supports resource-level ARNs, so both are necessarily
+            # domain-wide. These are reads; the DeleteApp statements below are what
+            # confine the function to one student's compute.
+            Effect: Allow
+            Action:
+              - sagemaker:ListApps
+              - sagemaker:ListSpaces
+            Resource: '*'
+          - Sid: StopAppsHangingOffTheProfile
+            Effect: Allow
+            Action: sagemaker:DeleteApp
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:app/${ExistingDomainId}/student-${StudentId}/*'
+          - Sid: StopAppsInsideThisStudentsSpaces
+            # A space-based app's ARN carries the SPACE name, which Studio invents at
+            # first launch (quickstart-default-xxxxxx), so it cannot be spelled out the
+            # way the statement above spells out the profile. Confined by the app's own
+            # OwnerUserProfileArn instead, as AWS's own Studio policies do.
+            Effect: Allow
+            Action: sagemaker:DeleteApp
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:app/${ExistingDomainId}/*'
+            Condition:
+              ArnEquals:
+                sagemaker:OwnerUserProfileArn: !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:user-profile/${ExistingDomainId}/student-${StudentId}'
+          - Effect: Allow
+            Action: logs:CreateLogGroup
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+          - Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/gpu-guardian-${StudentId}-stop-app:*'
+
+  # Declared explicitly, with retention, because Lambda's implicit log group is
+  # created with retention Never Expires - see docs/COSTING.md §4.3.
+
+  StopStudioAppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "CloudWatch Logs has no AWS-managed-key option, and this group is per student - see TRIAGE block"
+      checkov:
+        skip:
+          - id: "CKV_AWS_158"
+            comment: "Encrypted with the CloudWatch Logs service key; a per-student CMK is not justified - see TRIAGE block"
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/gpu-guardian-${StudentId}-stop-app'
+      RetentionInDays: 90
+
+  # Deletes the Space that Studio creates behind this template's back - Studio
+  # makes it when the student first opens JupyterLab, so it is not a resource here,
+  # and DeleteUserProfile is refused while it exists. Without this, DeleteStack
+  # lands in DELETE_FAILED for every student who ever opened a notebook.
+  # DependsOn puts it before the profile, since deletion runs in reverse order.
+
+  StudentStudioCleanup:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: StudentUserProfile
+    Properties:
+      ServiceToken: !GetAtt StudentStudioCleanupFunction.Arn
+
+  StudentStudioCleanupFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "FALSE POSITIVE - logs grant is inline on StudentStudioCleanupFunctionRole at the lines noted in the TRIAGE block"
+          - id: W89
+            reason: "Calls only the public SageMaker API and the CloudFormation response URL - nothing in the platform VPC to reach"
+          - id: W92
+            reason: "No ReservedConcurrentExecutions: a CloudFormation custom resource that runs once per student stack, at teardown. Reserving concurrency per student would consume the account pool linearly with class size to cap something that cannot loop."
+      checkov:
+        skip:
+          - id: "CKV_AWS_117"
+            comment: "Calls only public AWS APIs - no VPC resources to reach"
+          - id: "CKV_AWS_115"
+            comment: "Runs once per student stack lifetime, at teardown - no throughput to limit"
+          - id: "CKV_AWS_116"
+            comment: "No DLQ: invoked synchronously by CloudFormation, so there is no async retry path for a DLQ to catch. The handler already answers FAILED rather than raising, because an unanswered custom resource wedges the stack for an hour."
+          - id: "CKV_AWS_173"
+            comment: "Environment variables hold a domain id and a student id - no secrets. See TRIAGE block."
+    Properties:
+      FunctionName: !Sub 'gpu-guardian-${StudentId}-studio-cleanup'
+      # Explicit, same reason as StopStudioAppFunction - including the delete ordering,
+      # which matters more here: this function is the one actually RUNNING at teardown,
+      # so losing its group mid-run is the likelier of the two races.
+      LoggingConfig:
+        LogGroup: !Ref StudentStudioCleanupLogGroup
+      Runtime: python3.12
+      Handler: index.handler
+      # The full 15 minutes, nearly all of it waiting: DeleteApp takes minutes to
+      # reach Deleted and DeleteSpace is refused until it does.
+      Timeout: 900
+      Role: !GetAtt StudentStudioCleanupFunctionRole.Arn
+      Environment:
+        Variables:
+          DOMAIN_ID: !Ref ExistingDomainId
+          USER_PROFILE_NAME: !Sub 'student-${StudentId}'
+      Code:
+        ZipFile: |
+          import json, logging, os, time, urllib.request
+
+          import boto3
+
+          # logging, not print: the runtime stamps each record with the request id and a
+          # level, so a teardown that timed out on a stuck Space can be found by
+          # filtering the group on ERROR rather than by reading a 15-minute stream.
+          log = logging.getLogger()
+          log.setLevel(logging.INFO)
+
+          sm = boto3.client("sagemaker")
+
+          DOMAIN_ID    = os.environ["DOMAIN_ID"]
+          USER_PROFILE = os.environ["USER_PROFILE_NAME"]
+          GONE         = ("Deleted", "Failed")
+          POLL_SECONDS = 10
+
+
+          def paginate(method, key, **kwargs):
+              token = None
+              while True:
+                  page = method(**kwargs, **({"NextToken": token} if token else {}))
+                  yield from page[key]
+                  token = page.get("NextToken")
+                  if not token:
+                      return
+
+
+          def owned_spaces():
+              """Names of the Spaces this student's UserProfile owns - the things blocking the delete.
+
+              ListSpaces takes no owner filter, so the ownership match happens here. Only Spaces
+              this profile owns are ever touched: a shared Space reports no owner, fails this
+              test, and is left alone, which is correct - it is not this stack's to delete and it
+              would not block the profile either.
+              """
+              return {s["SpaceName"]
+                      for s in paginate(sm.list_spaces, "Spaces", DomainIdEquals=DOMAIN_ID)
+                      if (s.get("OwnershipSettingsSummary") or {}).get("OwnerUserProfileName") == USER_PROFILE}
+
+
+          def my_apps(spaces):
+              """Every app of this student's not already in a terminal state.
+
+              Matches on SpaceName as well as UserProfileName because an app inside a Space
+              reports UserProfileName as null - list_apps(UserProfileNameEquals=...) does not
+              return it at all, which is the same blindness that made the stop-app function a
+              no-op.
+              """
+              return [a for a in paginate(sm.list_apps, "Apps", DomainIdEquals=DOMAIN_ID)
+                      if (a.get("UserProfileName") == USER_PROFILE or a.get("SpaceName") in spaces)
+                      and a.get("Status") not in GONE]
+
+
+          def wait_until_gone(remaining, deadline, what):
+              while True:
+                  left = sorted(remaining())
+                  if not left:
+                      return
+                  if time.time() >= deadline:
+                      raise TimeoutError(f"{len(left)} {what} still present after the cleanup "
+                                         f"window: {left[:10]}")
+                  log.info("waiting on %d %s: %s", len(left), what, left[:5])
+                  time.sleep(POLL_SECONDS)
+
+
+          def cleanup(deadline):
+              spaces = owned_spaces()
+              for app in my_apps(spaces):
+                  # SpaceName XOR UserProfileName, matching how the app was created.
+                  owner = ({"SpaceName": app["SpaceName"]} if app.get("SpaceName")
+                           else {"UserProfileName": USER_PROFILE})
+                  log.info("deleting app %s (%s) in %s", app["AppName"], app["AppType"], owner)
+                  try:
+                      sm.delete_app(DomainId=DOMAIN_ID, AppType=app["AppType"],
+                                    AppName=app["AppName"], **owner)
+                  except sm.exceptions.ResourceNotFound:
+                      pass
+
+              # This wait is the reason the whole resource exists: DeleteSpace is refused
+              # while the Space holds an app, so the apps must actually reach Deleted -
+              # not merely have been asked to stop.
+              wait_until_gone(lambda: [a["AppName"] for a in my_apps(spaces)], deadline, "apps")
+
+              for space in spaces:
+                  log.info("deleting space %s", space)
+                  try:
+                      sm.delete_space(DomainId=DOMAIN_ID, SpaceName=space)
+                  except sm.exceptions.ResourceNotFound:
+                      pass
+
+              # And the Spaces have to be gone before DeleteUserProfile, which CloudFormation
+              # only attempts once this resource has reported back.
+              wait_until_gone(owned_spaces, deadline, "spaces")
+
+
+          def respond(event, context, status, reason):
+              """Hand-rolled rather than cfnresponse: that module only exists in the inline-code
+              runtime, and this function is inline today but would silently break the moment it
+              moved to a zip. Sent on every path, including failure - a custom resource that
+              never replies leaves the stack blocked for an hour.
+              """
+              body = json.dumps({
+                  "Status"             : status,
+                  "Reason"             : f"{reason} (log stream {context.log_stream_name})"[:1000],
+                  "PhysicalResourceId" : event.get("PhysicalResourceId") or context.log_stream_name,
+                  "StackId"            : event["StackId"],
+                  "RequestId"          : event["RequestId"],
+                  "LogicalResourceId"  : event["LogicalResourceId"],
+                  "Data"               : {},
+              }).encode()
+              request = urllib.request.Request(
+                  event["ResponseURL"], data=body, method="PUT",
+                  headers={"content-type": "", "content-length": str(len(body))},
+              )
+              urllib.request.urlopen(request).read()
+
+
+          def handler(event, context):
+              log.info(json.dumps({k: v for k, v in event.items() if k != "ResponseURL"}))
+              status, reason = "SUCCESS", "OK"
+              try:
+                  if event["RequestType"] == "Delete":
+                      # Leave a margin so a blown deadline still reports FAILED with the names of
+                      # whatever is stuck, instead of the Lambda being killed mid-poll and the
+                      # stack waiting out its full hour on no reply at all.
+                      margin = context.get_remaining_time_in_millis() / 1000 - 45
+                      cleanup(deadline=time.time() + margin)
+              except Exception as e:
+                  # FAILED on purpose rather than swallowed: DeleteUserProfile would fail
+                  # anyway, with a message naming no Space. Failing here puts the real
+                  # reason on the stack event. Idempotent, so retrying DeleteStack resumes.
+                  status, reason = "FAILED", str(e)
+                  log.exception("cleanup failed: %s", e)
+              respond(event, context, status, reason)
+
+  StudentStudioCleanupFunctionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit per-student name, consistent with the rest of this stack - see TRIAGE block"
+          - id: W11
+            reason: "Only FindThisStudentsSpacesAndApps uses '*', for read-only ListApps/ListSpaces which support no resource ARNs. The DeleteApp/DeleteSpace statements beside it are scoped by profile ARN and by OwnerUserProfileArn. See TRIAGE block."
+    Properties:
+      RoleName: !Sub 'gpu-guardian-${StudentId}-studio-cleanup-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      # Inline, unlike the sibling roles' separate AWS::IAM::Policy resources, and the
+      # difference matters: a standalone policy has no dependency path back to the
+      # custom resource, so CloudFormation could delete it in parallel with the very
+      # invocation that needs it. Inlined, it lives and dies with the role.
+      Policies:
+        - PolicyName: TearDownOneStudentsSpacesAndApps
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: FindThisStudentsSpacesAndApps
+                # Domain-wide because neither action supports resource-level ARNs.
+                Effect: Allow
+                Action:
+                  - sagemaker:ListApps
+                  - sagemaker:ListSpaces
+                Resource: '*'
+              - Sid: DeleteAppsHangingOffTheProfile
+                Effect: Allow
+                Action: sagemaker:DeleteApp
+                Resource: !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:app/${ExistingDomainId}/student-${StudentId}/*'
+              - Sid: DeleteAppsAndSpacesOwnedByThisProfile
+                # Studio names the Space at first launch, so the ARN cannot be spelled
+                # out - confined by its own OwnerUserProfileArn instead.
+                Effect: Allow
+                Action:
+                  - sagemaker:DeleteApp
+                  - sagemaker:DeleteSpace
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:app/${ExistingDomainId}/*'
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:space/${ExistingDomainId}/*'
+                Condition:
+                  ArnEquals:
+                    sagemaker:OwnerUserProfileArn: !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:user-profile/${ExistingDomainId}/student-${StudentId}'
+              - Effect: Allow
+                Action: logs:CreateLogGroup
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/gpu-guardian-${StudentId}-studio-cleanup:*'
+
+  StudentStudioCleanupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "CloudWatch Logs has no AWS-managed-key option, and this group is per student - see TRIAGE block"
+      checkov:
+        skip:
+          - id: "CKV_AWS_158"
+            comment: "Encrypted with the CloudWatch Logs service key; a per-student CMK is not justified - see TRIAGE block"
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/gpu-guardian-${StudentId}-studio-cleanup'
+      RetentionInDays: 90
+
+Outputs:
+  # The first five are read by the backend's stack_status_sync onto the student's
+  # record; three of them ARE the enforcement handles. Renaming an output key here
+  # silently leaves that student uncapped. The last two echo provisioning-time
+  # parameters, so a stack's Outputs alone record what it was created with.
+  StudioDomainId:
+    Description: Echoed back so a student stack's Outputs alone identify which domain it attached to.
+    Value: !Ref ExistingDomainId
+  StudentUserProfileName:
+    Value: !Sub 'student-${StudentId}'
+  StudentExecutionRoleArn:
+    Description: Role the deny policy is attached to at the cap.
+    Value: !GetAtt StudentExecutionRole.Arn
+  DenyNewAppsPolicyArn:
+    Description: Policy the admin backend attaches to block new sessions at the cap.
+    Value: !Ref DenyNewAppsPolicy
+  StopStudioAppFunctionArn:
+    Description: Function the admin backend invokes to stop notebooks already running at the cap.
+    Value: !GetAtt StopStudioAppFunction.Arn
+  PerStudentBudgetUsd:
+    Description: >-
+      Cap this student was provisioned with. Reference only - the enforced value
+      lives in the admin console's students table and may have been raised since.
+    Value: !Ref PerStudentBudgetUsd
+  NotificationEmail:
+    Description: >-
+      Ops contact recorded at provisioning time. No resource in this stack
+      consumes it - alerts go to the platform's consolidated admin-alerts topic -
+      but the backend's StackService.create still passes it as a stack parameter,
+      so the parameter cannot be removed without changing the backend in the same
+      breath. Echoed here so it is not a silently unused input.
+    Value: !Ref NotificationEmail
